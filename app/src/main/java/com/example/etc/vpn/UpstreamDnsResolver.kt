@@ -6,11 +6,15 @@ import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.util.Log
 import java.io.IOException
+import java.net.BindException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.Locale
+import java.util.concurrent.CancellationException
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.ExecutorService
@@ -22,6 +26,11 @@ import kotlin.math.min
 internal class UpstreamDnsResolver(
     private val vpnService: VpnService
 ) {
+    private data class InFlightQuery(
+        val future: Future<QueryResult>,
+        val task: CandidateQueryTask
+    )
+
     private data class UpstreamCandidate(
         val network: Network?,
         val dnsServer: InetAddress
@@ -37,6 +46,47 @@ internal class UpstreamDnsResolver(
         val response: ByteArray,
         val expiresAtMs: Long
     )
+
+    private inner class CandidateQueryTask(
+        private val candidate: UpstreamCandidate,
+        private val rawQuery: ByteArray
+    ) : Callable<QueryResult> {
+        @Volatile
+        private var udpSocket: DatagramSocket? = null
+
+        @Volatile
+        private var tcpSocket: Socket? = null
+
+        override fun call(): QueryResult {
+            return try {
+                val response = querySingleCandidate(
+                    candidate = candidate,
+                    rawQuery = rawQuery,
+                    onUdpSocketCreated = { socket -> udpSocket = socket },
+                    onTcpSocketCreated = { socket -> tcpSocket = socket }
+                )
+                QueryResult(candidate = candidate, response = response)
+            } catch (e: Exception) {
+                QueryResult(candidate = candidate, error = e)
+            } finally {
+                udpSocket = null
+                tcpSocket = null
+            }
+        }
+
+        fun cancel() {
+            try {
+                udpSocket?.close()
+            } catch (_: Exception) {
+                // Best effort cancel.
+            }
+            try {
+                tcpSocket?.close()
+            } catch (_: Exception) {
+                // Best effort cancel.
+            }
+        }
+    }
 
     private val connectivityManager =
         vpnService.getSystemService(ConnectivityManager::class.java)
@@ -80,39 +130,46 @@ internal class UpstreamDnsResolver(
             return null
         }
 
-        val completion = ExecutorCompletionService<QueryResult>(queryExecutor)
-        val futures = mutableListOf<Future<QueryResult>>()
-        val submitted = candidates.size
-
-        for (index in 0 until submitted) {
-            val candidate = candidates[index]
-            futures += completion.submit(
-                Callable {
-                    try {
-                        QueryResult(
-                            candidate = candidate,
-                            response = querySingleCandidate(candidate, rawQuery)
-                        )
-                    } catch (e: Exception) {
-                        QueryResult(
-                            candidate = candidate,
-                            error = e
-                        )
-                    }
-                }
-            )
+        var start = 0
+        while (start < candidates.size) {
+            val end = min(start + MAX_PARALLEL_QUERIES, candidates.size)
+            val batch = candidates.subList(start, end)
+            val response = queryCandidateBatch(rawQuery, batch)
+            if (response != null) {
+                return response
+            }
+            start = end
         }
 
-        for (index in 0 until submitted) {
+        return null
+    }
+
+    private fun queryCandidateBatch(
+        rawQuery: ByteArray,
+        batch: List<UpstreamCandidate>
+    ): ByteArray? {
+        val completion = ExecutorCompletionService<QueryResult>(queryExecutor)
+        val inFlight = mutableListOf<InFlightQuery>()
+
+        batch.forEach { candidate ->
+            val task = CandidateQueryTask(candidate = candidate, rawQuery = rawQuery)
+            val future = completion.submit(task)
+            inFlight += InFlightQuery(future = future, task = task)
+        }
+
+        for (index in batch.indices) {
             val future = try {
                 completion.take()
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
+                cancelInFlight(inFlight, except = null)
                 return null
             }
 
             val result = try {
                 future.get()
+            } catch (_: CancellationException) {
+                continue
             } catch (e: Exception) {
                 Log.w(LOG_TAG, "Upstream query future failed: ${e.message}")
                 continue
@@ -125,27 +182,68 @@ internal class UpstreamDnsResolver(
                     LOG_TAG,
                     "Upstream response from ${result.candidate.dnsServer.hostAddress} len=${response.size}"
                 )
-                futures.forEach { queued ->
-                    if (queued !== future) {
-                        queued.cancel(true)
-                    }
-                }
+                cancelInFlight(inFlight, except = future)
                 return response
             }
 
             markCandidateFailure(result.candidate, result.error)
         }
 
+        cancelInFlight(inFlight, except = null)
         return null
     }
 
-    private fun querySingleCandidate(candidate: UpstreamCandidate, rawQuery: ByteArray): ByteArray {
+    private fun cancelInFlight(
+        inFlight: List<InFlightQuery>,
+        except: Future<QueryResult>?
+    ) {
+        inFlight.forEach { item ->
+            if (item.future === except) {
+                return@forEach
+            }
+            item.task.cancel()
+            item.future.cancel(true)
+        }
+    }
+
+    private fun querySingleCandidate(
+        candidate: UpstreamCandidate,
+        rawQuery: ByteArray,
+        onUdpSocketCreated: ((DatagramSocket) -> Unit)? = null,
+        onTcpSocketCreated: ((Socket) -> Unit)? = null
+    ): ByteArray {
+        val udpError = try {
+            return querySingleCandidateUdp(candidate, rawQuery, onUdpSocketCreated)
+        } catch (e: Exception) {
+            e
+        }
+
+        Log.w(
+            LOG_TAG,
+            "UDP upstream failed for ${candidateHost(candidate)} (${udpError.message}), trying TCP fallback"
+        )
+
+        try {
+            return querySingleCandidateTcp(candidate, rawQuery, onTcpSocketCreated)
+        } catch (tcpError: Exception) {
+            tcpError.addSuppressed(udpError)
+            throw tcpError
+        }
+    }
+
+    private fun querySingleCandidateUdp(
+        candidate: UpstreamCandidate,
+        rawQuery: ByteArray,
+        onSocketCreated: ((DatagramSocket) -> Unit)? = null
+    ): ByteArray {
         val dnsServer = candidate.dnsServer
         DatagramSocket().use { socket ->
+            onSocketCreated?.invoke(socket)
+            if (!vpnService.protect(socket)) {
+                throw IOException("protect(socket) failed for ${dnsServer.hostAddress}")
+            }
             if (candidate.network != null) {
                 candidate.network.bindSocket(socket)
-            } else if (!vpnService.protect(socket)) {
-                throw IOException("protect(socket) failed for ${dnsServer.hostAddress}")
             }
 
             socket.soTimeout = SINGLE_QUERY_TIMEOUT_MS
@@ -159,6 +257,53 @@ internal class UpstreamDnsResolver(
         }
     }
 
+    private fun querySingleCandidateTcp(
+        candidate: UpstreamCandidate,
+        rawQuery: ByteArray,
+        onSocketCreated: ((Socket) -> Unit)? = null
+    ): ByteArray {
+        val dnsServer = candidate.dnsServer
+        Socket().use { socket ->
+            onSocketCreated?.invoke(socket)
+            if (!vpnService.protect(socket)) {
+                throw IOException("protect(tcp socket) failed for ${dnsServer.hostAddress}")
+            }
+            if (candidate.network != null) {
+                candidate.network.bindSocket(socket)
+            }
+
+            socket.soTimeout = TCP_QUERY_TIMEOUT_MS
+            socket.connect(InetSocketAddress(dnsServer, DNS_PORT), TCP_CONNECT_TIMEOUT_MS)
+
+            val output = socket.getOutputStream()
+            val input = socket.getInputStream()
+
+            val queryLength = rawQuery.size
+            if (queryLength <= 0 || queryLength > MAX_DNS_PACKET_SIZE) {
+                throw IOException("Invalid DNS query length=$queryLength")
+            }
+
+            output.write((queryLength ushr 8) and 0xFF)
+            output.write(queryLength and 0xFF)
+            output.write(rawQuery)
+            output.flush()
+
+            val lengthHi = input.read()
+            val lengthLo = input.read()
+            if (lengthHi < 0 || lengthLo < 0) {
+                throw IOException("TCP DNS response length prefix missing")
+            }
+            val responseLength = (lengthHi shl 8) or lengthLo
+            if (responseLength <= 0 || responseLength > MAX_DNS_PACKET_SIZE) {
+                throw IOException("Invalid TCP DNS response length=$responseLength")
+            }
+
+            val response = ByteArray(responseLength)
+            readFully(input, response)
+            return response
+        }
+    }
+
     private fun markCandidateSuccess(candidate: UpstreamCandidate) {
         val host = candidateHost(candidate)
         synchronized(candidateCooldownUntilMs) {
@@ -169,6 +314,20 @@ internal class UpstreamDnsResolver(
     private fun markCandidateFailure(candidate: UpstreamCandidate, error: Exception?) {
         val host = candidateHost(candidate)
         val message = error?.message ?: "unknown"
+        if (error is SocketTimeoutException) {
+            Log.w(LOG_TAG, "Upstream query failed for $host: Poll timed out")
+            synchronized(candidateCooldownUntilMs) {
+                candidateCooldownUntilMs[host] = System.currentTimeMillis() + CANDIDATE_COOLDOWN_MS
+            }
+            return
+        }
+        if (error is BindException || message.contains("bind failed", ignoreCase = true)) {
+            Log.w(LOG_TAG, "Upstream query failed for $host: bind failed")
+            synchronized(candidateCooldownUntilMs) {
+                candidateCooldownUntilMs[host] = System.currentTimeMillis() + CANDIDATE_COOLDOWN_MS
+            }
+            return
+        }
         Log.w(LOG_TAG, "Upstream query failed for $host: $message")
         if (message.contains("timed out", ignoreCase = true)) {
             synchronized(candidateCooldownUntilMs) {
@@ -183,6 +342,11 @@ internal class UpstreamDnsResolver(
 
         val manager = connectivityManager
         if (manager != null) {
+            val activeNetwork = try {
+                manager.activeNetwork
+            } catch (_: Exception) {
+                null
+            }
             val networks = try {
                 manager.allNetworks.toList()
             } catch (_: SecurityException) {
@@ -190,8 +354,11 @@ internal class UpstreamDnsResolver(
             } catch (_: Exception) {
                 emptyList()
             }
+            val sortedNetworks = networks.sortedWith(
+                compareByDescending<Network> { network -> network == activeNetwork }
+            )
 
-            networks.forEach { network ->
+            sortedNetworks.forEach { network ->
                 val capabilities = try {
                     manager.getNetworkCapabilities(network)
                 } catch (_: Exception) {
@@ -199,6 +366,9 @@ internal class UpstreamDnsResolver(
                 } ?: return@forEach
 
                 if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                    return@forEach
+                }
+                if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
                     return@forEach
                 }
 
@@ -413,6 +583,17 @@ internal class UpstreamDnsResolver(
         return candidate.dnsServer.hostAddress ?: "unknown"
     }
 
+    private fun readFully(input: java.io.InputStream, output: ByteArray) {
+        var offset = 0
+        while (offset < output.size) {
+            val read = input.read(output, offset, output.size - offset)
+            if (read < 0) {
+                throw IOException("Unexpected EOF while reading TCP DNS response")
+            }
+            offset += read
+        }
+    }
+
     private fun candidateLabel(candidate: UpstreamCandidate): String {
         val host = candidateHost(candidate)
         val networkPart = candidate.network?.let { "net=${it.hashCode()}" } ?: "protected"
@@ -426,7 +607,9 @@ internal class UpstreamDnsResolver(
         private const val DNS_PORT = 53
         private const val VPN_DNS_ADDRESS = "10.9.0.1"
         private const val SINGLE_QUERY_TIMEOUT_MS = 2000
-        private const val MAX_PARALLEL_QUERIES = 4
+        private const val TCP_CONNECT_TIMEOUT_MS = 2000
+        private const val TCP_QUERY_TIMEOUT_MS = 2500
+        private const val MAX_PARALLEL_QUERIES = 2
         private const val MAX_DNS_PACKET_SIZE = 4096
         private const val DNS_HEADER_SIZE = 12
         private const val MAX_CACHE_ENTRIES = 256
