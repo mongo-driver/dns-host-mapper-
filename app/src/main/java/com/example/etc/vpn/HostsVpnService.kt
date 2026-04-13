@@ -190,6 +190,31 @@ class HostsVpnService : VpnService() {
             "Query domain=$normalizedDomain type=${queryTypeName(parsedQuery.questionType)} class=$questionClass sourcePort=${udpPacket.sourcePort} mode=${if (isMdnsQuery) "mDNS" else "DNS"}"
         )
 
+        if (!isMdnsQuery &&
+            questionClass == DnsPacketCodec.CLASS_IN &&
+            parsedQuery.questionType == DnsPacketCodec.TYPE_PTR
+        ) {
+            Log.i(LOG_TAG, "PTR query for $normalizedDomain handled locally with empty response")
+            val ptrEmptyResponse = DnsPacketCodec.buildEmptyResponse(parsedQuery)
+            return if (udpPacket.ipVersion == 6) {
+                Ipv6PacketCodec.buildUdpIpv6Packet(
+                    sourceAddress = udpPacket.destinationAddress,
+                    destinationAddress = udpPacket.sourceAddress,
+                    sourcePort = udpPacket.destinationPort,
+                    destinationPort = udpPacket.sourcePort,
+                    payload = ptrEmptyResponse
+                )
+            } else {
+                Ipv4PacketCodec.buildUdpIpv4Packet(
+                    sourceAddress = udpPacket.destinationAddress,
+                    destinationAddress = udpPacket.sourceAddress,
+                    sourcePort = udpPacket.destinationPort,
+                    destinationPort = udpPacket.sourcePort,
+                    payload = ptrEmptyResponse
+                )
+            }
+        }
+
         val mappedAddress = HostRuleStore.resolveIpv4(this, normalizedDomain)
         val dnsResponsePayload = when {
             mappedAddress != null && questionClass == DnsPacketCodec.CLASS_IN -> {
@@ -361,6 +386,7 @@ class HostsVpnService : VpnService() {
     private fun queryTypeName(type: Int): String {
         return when (type) {
             DnsPacketCodec.TYPE_A -> "A"
+            DnsPacketCodec.TYPE_PTR -> "PTR"
             DnsPacketCodec.TYPE_AAAA -> "AAAA"
             DnsPacketCodec.TYPE_SVCB -> "SVCB"
             DnsPacketCodec.TYPE_HTTPS -> "HTTPS"

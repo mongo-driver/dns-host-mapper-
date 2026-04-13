@@ -13,6 +13,7 @@ internal data class ParsedDnsQuery(
 
 internal object DnsPacketCodec {
     const val TYPE_A = 1
+    const val TYPE_PTR = 12
     const val TYPE_AAAA = 28
     const val TYPE_SVCB = 64
     const val TYPE_HTTPS = 65

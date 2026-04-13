@@ -13,7 +13,6 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
-import java.net.URL
 import java.util.Locale
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Callable
@@ -21,7 +20,6 @@ import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
-import javax.net.ssl.HttpsURLConnection
 import kotlin.math.max
 import kotlin.math.min
 
@@ -120,12 +118,6 @@ internal class UpstreamDnsResolver(
         if (liveResponse != null) {
             cacheResponseIfEligible(queryKey, liveResponse)
             return liveResponse
-        }
-
-        val dohResponse = resolveOverHttps(rawQuery)
-        if (dohResponse != null) {
-            cacheResponseIfEligible(queryKey, dohResponse)
-            return dohResponse
         }
 
         val cachedResponse = readCachedResponse(queryKey, rawQuery)
@@ -433,22 +425,29 @@ internal class UpstreamDnsResolver(
             }
         }
 
-        if (all.isEmpty()) {
-            val fallback = listOf("1.1.1.1", "8.8.8.8").mapNotNull { value ->
-                try {
-                    InetAddress.getByName(value)
-                } catch (_: Exception) {
-                    null
-                }
+        val extraResolvers = NETWORK_FALLBACK_DNS.mapNotNull { value ->
+            try {
+                InetAddress.getByName(value)
+            } catch (_: Exception) {
+                null
             }
+        }
 
-            fallback.forEach { dns ->
-                val host = dns.hostAddress ?: return@forEach
-                if (host == VPN_DNS_ADDRESS) {
-                    return@forEach
-                }
-                if (seenHosts.add(host)) {
-                    all.add(UpstreamCandidate(network = null, dnsServer = dns))
+        if (manager != null) {
+            val activeNetwork = try {
+                manager.activeNetwork
+            } catch (_: Exception) {
+                null
+            }
+            if (activeNetwork != null) {
+                extraResolvers.forEach { dns ->
+                    val host = dns.hostAddress ?: return@forEach
+                    if (host == VPN_DNS_ADDRESS) {
+                        return@forEach
+                    }
+                    if (seenHosts.add(host)) {
+                        all.add(UpstreamCandidate(network = activeNetwork, dnsServer = dns))
+                    }
                 }
             }
         }
@@ -478,70 +477,6 @@ internal class UpstreamDnsResolver(
         }
 
         return withCooldown.take(MAX_PARALLEL_QUERIES)
-    }
-
-    private fun resolveOverHttps(rawQuery: ByteArray): ByteArray? {
-        val manager = connectivityManager ?: return null
-        val activeNetwork = try {
-            manager.activeNetwork
-        } catch (_: Exception) {
-            null
-        }
-        val networks = try {
-            manager.allNetworks.toList()
-        } catch (_: Exception) {
-            emptyList()
-        }
-            .sortedWith(compareByDescending<Network> { it == activeNetwork })
-            .filter { network ->
-                val capabilities = try {
-                    manager.getNetworkCapabilities(network)
-                } catch (_: Exception) {
-                    null
-                } ?: return@filter false
-                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
-                    capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            }
-
-        if (networks.isEmpty()) {
-            return null
-        }
-
-        for (network in networks.take(MAX_DOH_NETWORKS)) {
-            for (endpoint in DOH_ENDPOINTS) {
-                var connection: HttpsURLConnection? = null
-                try {
-                    val url = URL(endpoint)
-                    val opened = network.openConnection(url)
-                    connection = opened as? HttpsURLConnection ?: continue
-                    connection.requestMethod = "POST"
-                    connection.connectTimeout = DOH_CONNECT_TIMEOUT_MS
-                    connection.readTimeout = DOH_READ_TIMEOUT_MS
-                    connection.doOutput = true
-                    connection.setRequestProperty("Accept", "application/dns-message")
-                    connection.setRequestProperty("Content-Type", "application/dns-message")
-                    connection.outputStream.use { output ->
-                        output.write(rawQuery)
-                        output.flush()
-                    }
-
-                    val code = connection.responseCode
-                    if (code in 200..299) {
-                        val body = connection.inputStream.use { it.readBytes() }
-                        if (body.size >= DNS_HEADER_SIZE) {
-                            Log.i(LOG_TAG, "DoH response from $endpoint len=${body.size}")
-                            return body
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.w(LOG_TAG, "DoH query failed for $endpoint: ${e.message}")
-                } finally {
-                    connection?.disconnect()
-                }
-            }
-        }
-
-        return null
     }
 
     private fun buildQueryKey(rawQuery: ByteArray): String? {
@@ -765,13 +700,7 @@ internal class UpstreamDnsResolver(
         private const val TCP_CONNECT_TIMEOUT_MS = 2000
         private const val TCP_QUERY_TIMEOUT_MS = 2500
         private const val MAX_PARALLEL_QUERIES = 2
-        private const val MAX_DOH_NETWORKS = 1
-        private const val DOH_CONNECT_TIMEOUT_MS = 2000
-        private const val DOH_READ_TIMEOUT_MS = 2500
-        private val DOH_ENDPOINTS = arrayOf(
-            "https://dns.google/dns-query",
-            "https://cloudflare-dns.com/dns-query"
-        )
+        private val NETWORK_FALLBACK_DNS = arrayOf("8.8.8.8", "1.1.1.1", "9.9.9.9")
         private const val MAX_DNS_PACKET_SIZE = 4096
         private const val DNS_HEADER_SIZE = 12
         private const val MAX_CACHE_ENTRIES = 256
