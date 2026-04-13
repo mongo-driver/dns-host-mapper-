@@ -37,6 +37,16 @@ class HostsVpnService : VpnService() {
                 return START_NOT_STICKY
             }
 
+            ACTION_QUERY_STATE -> {
+                val running = active && tunnelInterface != null
+                Log.i(LOG_TAG, "State query requested, running=$running")
+                publishVpnState(running)
+                if (!running) {
+                    stopSelf()
+                }
+                return START_NOT_STICKY
+            }
+
             ACTION_START, null -> startVpnIfNeeded()
         }
         return START_NOT_STICKY
@@ -363,6 +373,7 @@ class HostsVpnService : VpnService() {
         private const val LOG_TAG = "DNS_HOST_MAP_TRACE"
         const val ACTION_START = "com.example.etc.action.START_VPN"
         const val ACTION_STOP = "com.example.etc.action.STOP_VPN"
+        const val ACTION_QUERY_STATE = "com.example.etc.action.QUERY_VPN_STATE"
         const val ACTION_VPN_STATE_CHANGED = "com.example.etc.action.VPN_STATE_CHANGED"
         const val EXTRA_VPN_RUNNING = "vpn_running"
 

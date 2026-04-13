@@ -81,11 +81,13 @@ class MainActivity : AppCompatActivity() {
         renderRules()
         renderVpnState()
         warnIfPrivateDnsEnabled()
+        requestVpnStateSync()
     }
 
     override fun onStart() {
         super.onStart()
         registerVpnStateReceiver()
+        requestVpnStateSync()
     }
 
     override fun onStop() {
@@ -183,6 +185,14 @@ class MainActivity : AppCompatActivity() {
         HostRuleStore.setVpnRunning(this, false)
         Log.i(LOG_TAG, "Stop VPN requested from UI")
         renderVpnState()
+    }
+
+    private fun requestVpnStateSync() {
+        startService(
+            Intent(this, HostsVpnService::class.java).apply {
+                action = HostsVpnService.ACTION_QUERY_STATE
+            }
+        )
     }
 
     private fun renderRules() {
