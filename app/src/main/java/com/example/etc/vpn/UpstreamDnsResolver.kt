@@ -13,6 +13,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.net.URL
 import java.util.Locale
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Callable
@@ -20,6 +21,7 @@ import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import javax.net.ssl.HttpsURLConnection
 import kotlin.math.max
 import kotlin.math.min
 
@@ -118,6 +120,12 @@ internal class UpstreamDnsResolver(
         if (liveResponse != null) {
             cacheResponseIfEligible(queryKey, liveResponse)
             return liveResponse
+        }
+
+        val dohResponse = resolveOverHttps(rawQuery)
+        if (dohResponse != null) {
+            cacheResponseIfEligible(queryKey, dohResponse)
+            return dohResponse
         }
 
         val cachedResponse = readCachedResponse(queryKey, rawQuery)
@@ -233,6 +241,10 @@ internal class UpstreamDnsResolver(
             e
         }
 
+        if (udpError is SocketTimeoutException) {
+            throw udpError
+        }
+
         Log.w(
             LOG_TAG,
             "UDP upstream failed for ${candidateHost(candidate)} (${udpError.message}), trying TCP fallback"
@@ -257,7 +269,9 @@ internal class UpstreamDnsResolver(
             if (candidate.network != null) {
                 candidate.network.bindSocket(socket)
             } else {
-                protectUdpIfPossible(socket, dnsServer)
+                if (!protectUdpIfPossible(socket, dnsServer)) {
+                    throw IOException("protect(udp) failed for ${dnsServer.hostAddress}")
+                }
             }
 
             socket.soTimeout = SINGLE_QUERY_TIMEOUT_MS
@@ -282,7 +296,9 @@ internal class UpstreamDnsResolver(
             if (candidate.network != null) {
                 candidate.network.bindSocket(socket)
             } else {
-                protectTcpIfPossible(socket, dnsServer)
+                if (!protectTcpIfPossible(socket, dnsServer)) {
+                    throw IOException("protect(tcp) failed for ${dnsServer.hostAddress}")
+                }
             }
 
             socket.soTimeout = TCP_QUERY_TIMEOUT_MS
@@ -417,21 +433,23 @@ internal class UpstreamDnsResolver(
             }
         }
 
-        val fallback = listOf("1.1.1.1", "8.8.8.8").mapNotNull { value ->
-            try {
-                InetAddress.getByName(value)
-            } catch (_: Exception) {
-                null
+        if (all.isEmpty()) {
+            val fallback = listOf("1.1.1.1", "8.8.8.8").mapNotNull { value ->
+                try {
+                    InetAddress.getByName(value)
+                } catch (_: Exception) {
+                    null
+                }
             }
-        }
 
-        fallback.forEach { dns ->
-            val host = dns.hostAddress ?: return@forEach
-            if (host == VPN_DNS_ADDRESS) {
-                return@forEach
-            }
-            if (seenHosts.add(host)) {
-                all.add(UpstreamCandidate(network = null, dnsServer = dns))
+            fallback.forEach { dns ->
+                val host = dns.hostAddress ?: return@forEach
+                if (host == VPN_DNS_ADDRESS) {
+                    return@forEach
+                }
+                if (seenHosts.add(host)) {
+                    all.add(UpstreamCandidate(network = null, dnsServer = dns))
+                }
             }
         }
 
@@ -439,13 +457,91 @@ internal class UpstreamDnsResolver(
     }
 
     private fun prioritizeCandidates(candidates: List<UpstreamCandidate>): List<UpstreamCandidate> {
+        if (candidates.isEmpty()) {
+            return emptyList()
+        }
+
         val now = System.currentTimeMillis()
         val cooldownSnapshot = synchronized(candidateCooldownUntilMs) { candidateCooldownUntilMs.toMap() }
-        return candidates.sortedBy { candidate ->
+        val withCooldown = candidates.sortedBy { candidate ->
             val host = candidateHost(candidate)
             val until = cooldownSnapshot[host] ?: 0L
             if (until <= now) 0L else max(1L, until - now)
         }
+
+        val ready = withCooldown.filter { candidate ->
+            val host = candidateHost(candidate)
+            (cooldownSnapshot[host] ?: 0L) <= now
+        }
+        if (ready.isNotEmpty()) {
+            return ready
+        }
+
+        return withCooldown.take(MAX_PARALLEL_QUERIES)
+    }
+
+    private fun resolveOverHttps(rawQuery: ByteArray): ByteArray? {
+        val manager = connectivityManager ?: return null
+        val activeNetwork = try {
+            manager.activeNetwork
+        } catch (_: Exception) {
+            null
+        }
+        val networks = try {
+            manager.allNetworks.toList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+            .sortedWith(compareByDescending<Network> { it == activeNetwork })
+            .filter { network ->
+                val capabilities = try {
+                    manager.getNetworkCapabilities(network)
+                } catch (_: Exception) {
+                    null
+                } ?: return@filter false
+                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                    capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            }
+
+        if (networks.isEmpty()) {
+            return null
+        }
+
+        for (network in networks.take(MAX_DOH_NETWORKS)) {
+            for (endpoint in DOH_ENDPOINTS) {
+                var connection: HttpsURLConnection? = null
+                try {
+                    val url = URL(endpoint)
+                    val opened = network.openConnection(url)
+                    connection = opened as? HttpsURLConnection ?: continue
+                    connection.requestMethod = "POST"
+                    connection.connectTimeout = DOH_CONNECT_TIMEOUT_MS
+                    connection.readTimeout = DOH_READ_TIMEOUT_MS
+                    connection.doOutput = true
+                    connection.setRequestProperty("Accept", "application/dns-message")
+                    connection.setRequestProperty("Content-Type", "application/dns-message")
+                    connection.outputStream.use { output ->
+                        output.write(rawQuery)
+                        output.flush()
+                    }
+
+                    val code = connection.responseCode
+                    if (code in 200..299) {
+                        val body = connection.inputStream.use { it.readBytes() }
+                        if (body.size >= DNS_HEADER_SIZE) {
+                            Log.i(LOG_TAG, "DoH response from $endpoint len=${body.size}")
+                            return body
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(LOG_TAG, "DoH query failed for $endpoint: ${e.message}")
+                } finally {
+                    connection?.disconnect()
+                }
+            }
+        }
+
+        return null
     }
 
     private fun buildQueryKey(rawQuery: ByteArray): String? {
@@ -599,24 +695,30 @@ internal class UpstreamDnsResolver(
         return candidate.dnsServer.hostAddress ?: "unknown"
     }
 
-    private fun protectUdpIfPossible(socket: DatagramSocket, dnsServer: InetAddress) {
+    private fun protectUdpIfPossible(socket: DatagramSocket, dnsServer: InetAddress): Boolean {
         try {
             if (!vpnService.protect(socket)) {
-                Log.w(LOG_TAG, "protect(udp) returned false for ${dnsServer.hostAddress}, continuing")
+                Log.w(LOG_TAG, "protect(udp) returned false for ${dnsServer.hostAddress}")
+                return false
             }
         } catch (e: Exception) {
             Log.w(LOG_TAG, "protect(udp) threw for ${dnsServer.hostAddress}: ${e.message}")
+            return false
         }
+        return true
     }
 
-    private fun protectTcpIfPossible(socket: Socket, dnsServer: InetAddress) {
+    private fun protectTcpIfPossible(socket: Socket, dnsServer: InetAddress): Boolean {
         try {
             if (!vpnService.protect(socket)) {
-                Log.w(LOG_TAG, "protect(tcp) returned false for ${dnsServer.hostAddress}, continuing")
+                Log.w(LOG_TAG, "protect(tcp) returned false for ${dnsServer.hostAddress}")
+                return false
             }
         } catch (e: Exception) {
             Log.w(LOG_TAG, "protect(tcp) threw for ${dnsServer.hostAddress}: ${e.message}")
+            return false
         }
+        return true
     }
 
     private fun isCancellationLike(error: Exception): Boolean {
@@ -663,6 +765,13 @@ internal class UpstreamDnsResolver(
         private const val TCP_CONNECT_TIMEOUT_MS = 2000
         private const val TCP_QUERY_TIMEOUT_MS = 2500
         private const val MAX_PARALLEL_QUERIES = 2
+        private const val MAX_DOH_NETWORKS = 1
+        private const val DOH_CONNECT_TIMEOUT_MS = 2000
+        private const val DOH_READ_TIMEOUT_MS = 2500
+        private val DOH_ENDPOINTS = arrayOf(
+            "https://dns.google/dns-query",
+            "https://cloudflare-dns.com/dns-query"
+        )
         private const val MAX_DNS_PACKET_SIZE = 4096
         private const val DNS_HEADER_SIZE = 12
         private const val MAX_CACHE_ENTRIES = 256
