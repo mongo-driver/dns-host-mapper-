@@ -271,6 +271,7 @@ class HostsVpnService : VpnService() {
         tunnelThread?.interrupt()
         tunnelThread = null
         closeTunnelInterface()
+        upstreamResolver?.close()
         upstreamResolver = null
         mdnsLocalResponder?.stop()
         mdnsLocalResponder = null
