@@ -52,6 +52,9 @@ internal class UpstreamDnsResolver(
         private val rawQuery: ByteArray
     ) : Callable<QueryResult> {
         @Volatile
+        private var cancelled = false
+
+        @Volatile
         private var udpSocket: DatagramSocket? = null
 
         @Volatile
@@ -67,7 +70,11 @@ internal class UpstreamDnsResolver(
                 )
                 QueryResult(candidate = candidate, response = response)
             } catch (e: Exception) {
-                QueryResult(candidate = candidate, error = e)
+                if (cancelled || isCancellationLike(e)) {
+                    QueryResult(candidate = candidate, error = CancellationException("candidate canceled"))
+                } else {
+                    QueryResult(candidate = candidate, error = e)
+                }
             } finally {
                 udpSocket = null
                 tcpSocket = null
@@ -75,6 +82,7 @@ internal class UpstreamDnsResolver(
         }
 
         fun cancel() {
+            cancelled = true
             try {
                 udpSocket?.close()
             } catch (_: Exception) {
@@ -175,6 +183,10 @@ internal class UpstreamDnsResolver(
                 continue
             }
 
+            if (result.error is CancellationException) {
+                continue
+            }
+
             val response = result.response
             if (response != null) {
                 markCandidateSuccess(result.candidate)
@@ -215,6 +227,9 @@ internal class UpstreamDnsResolver(
         val udpError = try {
             return querySingleCandidateUdp(candidate, rawQuery, onUdpSocketCreated)
         } catch (e: Exception) {
+            if (isCancellationLike(e)) {
+                throw CancellationException("UDP query canceled")
+            }
             e
         }
 
@@ -239,11 +254,10 @@ internal class UpstreamDnsResolver(
         val dnsServer = candidate.dnsServer
         DatagramSocket().use { socket ->
             onSocketCreated?.invoke(socket)
-            if (!vpnService.protect(socket)) {
-                throw IOException("protect(socket) failed for ${dnsServer.hostAddress}")
-            }
             if (candidate.network != null) {
                 candidate.network.bindSocket(socket)
+            } else {
+                protectUdpIfPossible(socket, dnsServer)
             }
 
             socket.soTimeout = SINGLE_QUERY_TIMEOUT_MS
@@ -265,11 +279,10 @@ internal class UpstreamDnsResolver(
         val dnsServer = candidate.dnsServer
         Socket().use { socket ->
             onSocketCreated?.invoke(socket)
-            if (!vpnService.protect(socket)) {
-                throw IOException("protect(tcp socket) failed for ${dnsServer.hostAddress}")
-            }
             if (candidate.network != null) {
                 candidate.network.bindSocket(socket)
+            } else {
+                protectTcpIfPossible(socket, dnsServer)
             }
 
             socket.soTimeout = TCP_QUERY_TIMEOUT_MS
@@ -312,6 +325,9 @@ internal class UpstreamDnsResolver(
     }
 
     private fun markCandidateFailure(candidate: UpstreamCandidate, error: Exception?) {
+        if (error != null && isCancellationLike(error)) {
+            return
+        }
         val host = candidateHost(candidate)
         val message = error?.message ?: "unknown"
         if (error is SocketTimeoutException) {
@@ -581,6 +597,43 @@ internal class UpstreamDnsResolver(
 
     private fun candidateHost(candidate: UpstreamCandidate): String {
         return candidate.dnsServer.hostAddress ?: "unknown"
+    }
+
+    private fun protectUdpIfPossible(socket: DatagramSocket, dnsServer: InetAddress) {
+        try {
+            if (!vpnService.protect(socket)) {
+                Log.w(LOG_TAG, "protect(udp) returned false for ${dnsServer.hostAddress}, continuing")
+            }
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "protect(udp) threw for ${dnsServer.hostAddress}: ${e.message}")
+        }
+    }
+
+    private fun protectTcpIfPossible(socket: Socket, dnsServer: InetAddress) {
+        try {
+            if (!vpnService.protect(socket)) {
+                Log.w(LOG_TAG, "protect(tcp) returned false for ${dnsServer.hostAddress}, continuing")
+            }
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "protect(tcp) threw for ${dnsServer.hostAddress}: ${e.message}")
+        }
+    }
+
+    private fun isCancellationLike(error: Exception): Boolean {
+        if (error is CancellationException) {
+            return true
+        }
+        val message = error.message?.lowercase(Locale.US).orEmpty()
+        if (message.contains("interrupted")) {
+            return true
+        }
+        if (message.contains("socket closed")) {
+            return true
+        }
+        if (message.contains("bad file descriptor") || message.contains("ebadf")) {
+            return true
+        }
+        return false
     }
 
     private fun readFully(input: java.io.InputStream, output: ByteArray) {
