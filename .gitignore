@@ -1,0 +1,48 @@
+# Gradle and build output
+.gradle/
+build/
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local SDK and machine-specific state
+local.properties
+.android/
+.android-user-home/
+.gradle-user-home/
+.kotlin/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+captures/
+
+# Native build output
+.externalNativeBuild/
+.cxx/
+
+# Signing and local secrets
+*.jks
+*.keystore
+*.p12
+*.pem
+
+# Packaged artifacts
+*.apk
+*.ap_
+*.aab
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.orig
+
+# Other editors
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

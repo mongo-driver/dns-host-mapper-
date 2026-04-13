@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">DNS Host Mapper</string>
+    <string name="main_title">DNS Host Mapper VPN</string>
+    <string name="main_subtitle">Add domain to IPv4 mappings like a local hosts file.</string>
+    <string name="domain_hint">Domain (example: hasan.local)</string>
+    <string name="ip_hint">IPv4 (example: 192.168.6.5)</string>
+    <string name="add_rule">Save Rule</string>
+    <string name="start_vpn">Start VPN</string>
+    <string name="stop_vpn">Stop VPN</string>
+    <string name="rules_label">Saved Rules</string>
+    <string name="rules_empty">No rules yet. Add one above.</string>
+    <string name="rules_hint">Long press a rule to delete it.</string>
+    <string name="invalid_domain">Enter a valid domain name.</string>
+    <string name="invalid_ip">Enter a valid IPv4 address.</string>
+    <string name="rule_saved">Rule saved.</string>
+    <string name="rule_deleted">Rule deleted.</string>
+    <string name="vpn_permission_denied">VPN permission denied.</string>
+    <string name="delete_rule_title">Delete rule</string>
+    <string name="delete_rule_message">Delete mapping for %1$s?</string>
+    <string name="cancel">Cancel</string>
+    <string name="delete">Delete</string>
+    <string name="vpn_status_running">VPN is running.</string>
+    <string name="vpn_status_stopped">VPN is stopped.</string>
+    <string name="vpn_session_name">DNS Host Mapper</string>
+    <string name="rule_updated">Rule updated.</string>
+    <string name="private_dns_warning">Private DNS can bypass custom host rules. Set Private DNS to Off.</string>
+</resources>
