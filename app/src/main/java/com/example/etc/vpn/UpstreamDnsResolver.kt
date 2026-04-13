@@ -105,6 +105,8 @@ internal class UpstreamDnsResolver(
         }
     }
     private val candidateCooldownUntilMs = mutableMapOf<String, Long>()
+    private val candidateConsecutiveFailures = mutableMapOf<String, Int>()
+    private val candidateSuccessCount = mutableMapOf<String, Int>()
 
     @Volatile
     private var privateDnsWarningLogged = false
@@ -118,6 +120,12 @@ internal class UpstreamDnsResolver(
         if (liveResponse != null) {
             cacheResponseIfEligible(queryKey, liveResponse)
             return liveResponse
+        }
+
+        val systemFallback = resolveUsingSystemDns(rawQuery)
+        if (systemFallback != null) {
+            cacheResponseIfEligible(queryKey, systemFallback)
+            return systemFallback
         }
 
         val cachedResponse = readCachedResponse(queryKey, rawQuery)
@@ -329,6 +337,8 @@ internal class UpstreamDnsResolver(
         val host = candidateHost(candidate)
         synchronized(candidateCooldownUntilMs) {
             candidateCooldownUntilMs.remove(host)
+            candidateConsecutiveFailures.remove(host)
+            candidateSuccessCount[host] = (candidateSuccessCount[host] ?: 0) + 1
         }
     }
 
@@ -338,26 +348,43 @@ internal class UpstreamDnsResolver(
         }
         val host = candidateHost(candidate)
         val message = error?.message ?: "unknown"
-        if (error is SocketTimeoutException) {
-            Log.w(LOG_TAG, "Upstream query failed for $host: Poll timed out")
-            synchronized(candidateCooldownUntilMs) {
-                candidateCooldownUntilMs[host] = System.currentTimeMillis() + CANDIDATE_COOLDOWN_MS
-            }
-            return
+        val isTimeoutLike = error is SocketTimeoutException || message.contains("timed out", ignoreCase = true)
+        val isBindLike = error is BindException || message.contains("bind failed", ignoreCase = true)
+
+        val failureCount: Int
+        val hasSuccess: Boolean
+        synchronized(candidateCooldownUntilMs) {
+            failureCount = (candidateConsecutiveFailures[host] ?: 0) + 1
+            candidateConsecutiveFailures[host] = failureCount
+            hasSuccess = (candidateSuccessCount[host] ?: 0) > 0
         }
-        if (error is BindException || message.contains("bind failed", ignoreCase = true)) {
-            Log.w(LOG_TAG, "Upstream query failed for $host: bind failed")
-            synchronized(candidateCooldownUntilMs) {
-                candidateCooldownUntilMs[host] = System.currentTimeMillis() + CANDIDATE_COOLDOWN_MS
+
+        val cooldownMs = when {
+            isTimeoutLike || isBindLike -> {
+                if (!hasSuccess && failureCount >= COLD_START_FAILURE_THRESHOLD) {
+                    CANDIDATE_LONG_COOLDOWN_MS
+                } else {
+                    CANDIDATE_COOLDOWN_MS
+                }
             }
-            return
+
+            else -> 0L
         }
-        Log.w(LOG_TAG, "Upstream query failed for $host: $message")
-        if (message.contains("timed out", ignoreCase = true)) {
+        if (cooldownMs > 0L) {
             synchronized(candidateCooldownUntilMs) {
-                candidateCooldownUntilMs[host] = System.currentTimeMillis() + CANDIDATE_COOLDOWN_MS
+                candidateCooldownUntilMs[host] = System.currentTimeMillis() + cooldownMs
             }
         }
+
+        val errorLabel = when {
+            isTimeoutLike -> "Poll timed out"
+            isBindLike -> "bind failed"
+            else -> message
+        }
+        Log.w(
+            LOG_TAG,
+            "Upstream query failed for $host: $errorLabel (failures=$failureCount${if (cooldownMs > 0L) ", cooldownMs=$cooldownMs" else ""})"
+        )
     }
 
     private fun findDnsCandidates(): List<UpstreamCandidate> {
@@ -393,6 +420,9 @@ internal class UpstreamDnsResolver(
                     return@forEach
                 }
                 if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                    return@forEach
+                }
+                if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
                     return@forEach
                 }
 
@@ -440,6 +470,18 @@ internal class UpstreamDnsResolver(
                 null
             }
             if (activeNetwork != null) {
+                val activeCaps = try {
+                    manager.getNetworkCapabilities(activeNetwork)
+                } catch (_: Exception) {
+                    null
+                }
+                if (activeCaps == null ||
+                    activeCaps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                    !activeCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ||
+                    !activeCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                ) {
+                    return prioritizeCandidates(all)
+                }
                 extraResolvers.forEach { dns ->
                     val host = dns.hostAddress ?: return@forEach
                     if (host == VPN_DNS_ADDRESS) {
@@ -461,22 +503,106 @@ internal class UpstreamDnsResolver(
         }
 
         val now = System.currentTimeMillis()
-        val cooldownSnapshot = synchronized(candidateCooldownUntilMs) { candidateCooldownUntilMs.toMap() }
-        val withCooldown = candidates.sortedBy { candidate ->
-            val host = candidateHost(candidate)
-            val until = cooldownSnapshot[host] ?: 0L
-            if (until <= now) 0L else max(1L, until - now)
+        val (cooldownSnapshot, failureSnapshot, successSnapshot) = synchronized(candidateCooldownUntilMs) {
+            Triple(
+                candidateCooldownUntilMs.toMap(),
+                candidateConsecutiveFailures.toMap(),
+                candidateSuccessCount.toMap()
+            )
         }
+        val withCooldown = candidates.sortedWith(
+            compareBy<UpstreamCandidate>(
+                { candidate ->
+                    val host = candidateHost(candidate)
+                    val until = cooldownSnapshot[host] ?: 0L
+                    if (until <= now) 0 else 1
+                },
+                { candidate ->
+                    val host = candidateHost(candidate)
+                    val until = cooldownSnapshot[host] ?: 0L
+                    if (until <= now) 0L else max(1L, until - now)
+                },
+                { candidate ->
+                    val host = candidateHost(candidate)
+                    failureSnapshot[host] ?: 0
+                },
+                { candidate ->
+                    val host = candidateHost(candidate)
+                    -(successSnapshot[host] ?: 0)
+                }
+            )
+        )
 
         val ready = withCooldown.filter { candidate ->
             val host = candidateHost(candidate)
             (cooldownSnapshot[host] ?: 0L) <= now
         }
         if (ready.isNotEmpty()) {
-            return ready
+            if (ready.size >= MIN_READY_CANDIDATES) {
+                return ready
+            }
+            val extra = withCooldown.filterNot { candidate -> ready.contains(candidate) }
+                .take(MIN_READY_CANDIDATES - ready.size)
+            return ready + extra
         }
 
         return withCooldown.take(MAX_PARALLEL_QUERIES)
+    }
+
+    private fun resolveUsingSystemDns(rawQuery: ByteArray): ByteArray? {
+        val parsed = DnsPacketCodec.parseQuery(rawQuery) ?: return null
+        val questionClass = parsed.questionClass and 0x7FFF
+        if (questionClass != DnsPacketCodec.CLASS_IN) {
+            return null
+        }
+        if (parsed.questionType != DnsPacketCodec.TYPE_A && parsed.questionType != DnsPacketCodec.TYPE_ANY) {
+            return null
+        }
+
+        val host = parsed.questionName.trim().trimEnd('.')
+        if (host.isBlank()) {
+            return null
+        }
+
+        val manager = connectivityManager ?: return null
+        val activeNetwork = try {
+            manager.activeNetwork
+        } catch (_: Exception) {
+            null
+        }
+        val networks = try {
+            manager.allNetworks.toList()
+        } catch (_: Exception) {
+            emptyList()
+        }.sortedWith(compareByDescending<Network> { it == activeNetwork })
+
+        for (network in networks) {
+            val capabilities = try {
+                manager.getNetworkCapabilities(network)
+            } catch (_: Exception) {
+                null
+            } ?: continue
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                continue
+            }
+            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                continue
+            }
+            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                continue
+            }
+
+            try {
+                val resolved = network.getAllByName(host)
+                val ipv4 = resolved.firstOrNull { address -> address.address.size == 4 }?.address ?: continue
+                Log.i(LOG_TAG, "System DNS fallback resolved $host via net=${network.hashCode()}")
+                return DnsPacketCodec.buildAResponse(parsed, ipv4)
+            } catch (_: Exception) {
+                // Try next network.
+            }
+        }
+
+        return null
     }
 
     private fun buildQueryKey(rawQuery: ByteArray): String? {
@@ -580,7 +706,7 @@ internal class UpstreamDnsResolver(
             offset += rdLength
 
             val ttlInt = if (ttl > Int.MAX_VALUE.toLong()) Int.MAX_VALUE else ttl.toInt()
-            minTtl = if (minTtl == null) ttlInt else min(minTtl!!, ttlInt)
+            minTtl = minTtl?.let { current -> min(current, ttlInt) } ?: ttlInt
         }
 
         return minTtl
@@ -687,19 +813,30 @@ internal class UpstreamDnsResolver(
     private fun candidateLabel(candidate: UpstreamCandidate): String {
         val host = candidateHost(candidate)
         val networkPart = candidate.network?.let { "net=${it.hashCode()}" } ?: "protected"
-        val cooldownUntil = synchronized(candidateCooldownUntilMs) { candidateCooldownUntilMs[host] ?: 0L }
+        val (cooldownUntil, failures, successes) = synchronized(candidateCooldownUntilMs) {
+            Triple(
+                candidateCooldownUntilMs[host] ?: 0L,
+                candidateConsecutiveFailures[host] ?: 0,
+                candidateSuccessCount[host] ?: 0
+            )
+        }
         val cooldown = max(0L, cooldownUntil - System.currentTimeMillis())
-        return if (cooldown > 0L) "$host($networkPart,cooldownMs=$cooldown)" else "$host($networkPart)"
+        return if (cooldown > 0L) {
+            "$host($networkPart,cooldownMs=$cooldown,failures=$failures,successes=$successes)"
+        } else {
+            "$host($networkPart,failures=$failures,successes=$successes)"
+        }
     }
 
     companion object {
         private const val LOG_TAG = "DNS_HOST_MAP_TRACE"
         private const val DNS_PORT = 53
         private const val VPN_DNS_ADDRESS = "10.9.0.1"
-        private const val SINGLE_QUERY_TIMEOUT_MS = 2000
+        private const val SINGLE_QUERY_TIMEOUT_MS = 1500
         private const val TCP_CONNECT_TIMEOUT_MS = 2000
         private const val TCP_QUERY_TIMEOUT_MS = 2500
-        private const val MAX_PARALLEL_QUERIES = 2
+        private const val MAX_PARALLEL_QUERIES = 4
+        private const val MIN_READY_CANDIDATES = 2
         private val NETWORK_FALLBACK_DNS = arrayOf("8.8.8.8", "1.1.1.1", "9.9.9.9")
         private const val MAX_DNS_PACKET_SIZE = 4096
         private const val DNS_HEADER_SIZE = 12
@@ -709,5 +846,7 @@ internal class UpstreamDnsResolver(
         private const val MAX_CACHE_TTL_SECONDS = 300
         private const val STALE_CACHE_GRACE_MS = 120_000L
         private const val CANDIDATE_COOLDOWN_MS = 20_000L
+        private const val CANDIDATE_LONG_COOLDOWN_MS = 120_000L
+        private const val COLD_START_FAILURE_THRESHOLD = 3
     }
 }
