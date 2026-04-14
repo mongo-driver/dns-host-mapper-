@@ -5,6 +5,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.util.Log
+import com.example.etc.data.HostRuleStore
 import java.io.IOException
 import java.net.BindException
 import java.net.DatagramPacket
@@ -33,7 +34,8 @@ internal class UpstreamDnsResolver(
 
     private data class UpstreamCandidate(
         val network: Network?,
-        val dnsServer: InetAddress
+        val dnsServer: InetAddress,
+        val priority: Int
     )
 
     private data class QueryResult(
@@ -387,6 +389,29 @@ internal class UpstreamDnsResolver(
         val all = mutableListOf<UpstreamCandidate>()
         val seenHosts = linkedSetOf<String>()
 
+        val customResolvers = HostRuleStore.loadCustomDnsServers(vpnService).mapNotNull { value ->
+            try {
+                InetAddress.getByName(value)
+            } catch (_: Exception) {
+                null
+            }
+        }
+        customResolvers.forEach { dns ->
+            val host = dns.hostAddress ?: return@forEach
+            if (host == VPN_DNS_ADDRESS) {
+                return@forEach
+            }
+            if (seenHosts.add(host)) {
+                all.add(
+                    UpstreamCandidate(
+                        network = null,
+                        dnsServer = dns,
+                        priority = PRIORITY_CUSTOM
+                    )
+                )
+            }
+        }
+
         val manager = connectivityManager
         val activeNetwork = if (manager != null) {
             try {
@@ -447,7 +472,13 @@ internal class UpstreamDnsResolver(
                         return@forEach
                     }
                     if (seenHosts.add(host)) {
-                        all.add(UpstreamCandidate(network = network, dnsServer = dns))
+                        all.add(
+                            UpstreamCandidate(
+                                network = network,
+                                dnsServer = dns,
+                                priority = PRIORITY_NETWORK_DISCOVERED
+                            )
+                        )
                     }
                 }
             }
@@ -481,7 +512,13 @@ internal class UpstreamDnsResolver(
                     return@forEach
                 }
                 if (seenHosts.add(host)) {
-                    all.add(UpstreamCandidate(network = activeNetwork, dnsServer = dns))
+                    all.add(
+                        UpstreamCandidate(
+                            network = activeNetwork,
+                            dnsServer = dns,
+                            priority = PRIORITY_ACTIVE_NETWORK_FALLBACK
+                        )
+                    )
                 }
             }
         }
@@ -492,7 +529,15 @@ internal class UpstreamDnsResolver(
             if (host == VPN_DNS_ADDRESS) {
                 return@forEach
             }
-            all.add(UpstreamCandidate(network = null, dnsServer = dns))
+            if (seenHosts.add(host)) {
+                all.add(
+                    UpstreamCandidate(
+                        network = null,
+                        dnsServer = dns,
+                        priority = PRIORITY_PROTECTED_FALLBACK
+                    )
+                )
+            }
         }
 
         return prioritizeCandidates(all)
@@ -522,6 +567,9 @@ internal class UpstreamDnsResolver(
                     val host = candidateHost(candidate)
                     val until = cooldownSnapshot[host] ?: 0L
                     if (until <= now) 0L else max(1L, until - now)
+                },
+                { candidate ->
+                    candidate.priority
                 },
                 { candidate ->
                     val host = candidateHost(candidate)
@@ -811,6 +859,13 @@ internal class UpstreamDnsResolver(
     private fun candidateLabel(candidate: UpstreamCandidate): String {
         val host = candidateHost(candidate)
         val networkPart = candidate.network?.let { "net=${it.hashCode()}" } ?: "protected"
+        val sourcePart = when (candidate.priority) {
+            PRIORITY_CUSTOM -> "custom"
+            PRIORITY_NETWORK_DISCOVERED -> "network"
+            PRIORITY_ACTIVE_NETWORK_FALLBACK -> "active_fallback"
+            PRIORITY_PROTECTED_FALLBACK -> "protected_fallback"
+            else -> "unknown"
+        }
         val (cooldownUntil, failures, successes) = synchronized(candidateCooldownUntilMs) {
             Triple(
                 candidateCooldownUntilMs[host] ?: 0L,
@@ -820,9 +875,9 @@ internal class UpstreamDnsResolver(
         }
         val cooldown = max(0L, cooldownUntil - System.currentTimeMillis())
         return if (cooldown > 0L) {
-            "$host($networkPart,cooldownMs=$cooldown,failures=$failures,successes=$successes)"
+            "$host($networkPart,source=$sourcePart,cooldownMs=$cooldown,failures=$failures,successes=$successes)"
         } else {
-            "$host($networkPart,failures=$failures,successes=$successes)"
+            "$host($networkPart,source=$sourcePart,failures=$failures,successes=$successes)"
         }
     }
 
@@ -836,6 +891,10 @@ internal class UpstreamDnsResolver(
         private const val MAX_PARALLEL_QUERIES = 4
         private const val MIN_READY_CANDIDATES = 2
         private val NETWORK_FALLBACK_DNS = arrayOf("8.8.8.8", "1.1.1.1", "9.9.9.9")
+        private const val PRIORITY_CUSTOM = 0
+        private const val PRIORITY_NETWORK_DISCOVERED = 10
+        private const val PRIORITY_ACTIVE_NETWORK_FALLBACK = 20
+        private const val PRIORITY_PROTECTED_FALLBACK = 30
         private const val MAX_DNS_PACKET_SIZE = 4096
         private const val DNS_HEADER_SIZE = 12
         private const val MAX_CACHE_ENTRIES = 256

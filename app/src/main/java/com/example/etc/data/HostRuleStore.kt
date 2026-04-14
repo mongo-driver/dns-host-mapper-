@@ -8,6 +8,7 @@ import java.util.Locale
 object HostRuleStore {
     private const val PREFS_NAME = "dns_host_mapper_prefs"
     private const val KEY_RULES_JSON = "rules_json"
+    private const val KEY_CUSTOM_DNS_JSON = "custom_dns_json"
     private const val KEY_VPN_RUNNING = "vpn_running"
 
     @Volatile
@@ -15,6 +16,12 @@ object HostRuleStore {
 
     @Volatile
     private var cachedMap: Map<String, ByteArray> = emptyMap()
+
+    @Volatile
+    private var cachedCustomDnsJson: String? = null
+
+    @Volatile
+    private var cachedCustomDnsServers: List<String> = emptyList()
 
     fun loadRules(context: Context): MutableList<HostRule> {
         val json = prefs(context).getString(KEY_RULES_JSON, "[]") ?: "[]"
@@ -24,8 +31,8 @@ object HostRuleStore {
     fun saveRules(context: Context, rules: List<HostRule>) {
         val normalized = rules.mapNotNull { rule ->
             val domain = normalizeDomain(rule.domain)
-            val ipv4 = parseIpv4(rule.ip) ?: return@mapNotNull null
-            HostRule(domain = domain, ip = ipv4.joinToString(".") { byte -> (byte.toInt() and 0xFF).toString() })
+            val ipv4 = normalizeIpv4(rule.ip) ?: return@mapNotNull null
+            HostRule(domain = domain, ip = ipv4)
         }
 
         val array = JSONArray()
@@ -60,6 +67,40 @@ object HostRuleStore {
         val map = getRuleMap(context)
         val value = map[normalizedDomain] ?: return null
         return value.copyOf()
+    }
+
+    fun loadCustomDnsServers(context: Context): List<String> {
+        val json = prefs(context).getString(KEY_CUSTOM_DNS_JSON, "[]") ?: "[]"
+        synchronized(this) {
+            if (json == cachedCustomDnsJson) {
+                return cachedCustomDnsServers
+            }
+            val parsed = parseCustomDnsServers(json)
+            cachedCustomDnsJson = json
+            cachedCustomDnsServers = parsed
+            return cachedCustomDnsServers
+        }
+    }
+
+    fun saveCustomDnsServers(context: Context, servers: List<String>) {
+        val normalized = servers
+            .mapNotNull { normalizeIpv4(it) }
+            .distinct()
+
+        val array = JSONArray()
+        normalized.forEach { dns ->
+            array.put(dns)
+        }
+
+        prefs(context)
+            .edit()
+            .putString(KEY_CUSTOM_DNS_JSON, array.toString())
+            .apply()
+
+        synchronized(this) {
+            cachedCustomDnsJson = null
+            cachedCustomDnsServers = emptyList()
+        }
     }
 
     private fun getRuleMap(context: Context): Map<String, ByteArray> {
@@ -103,6 +144,25 @@ object HostRuleStore {
         return out
     }
 
+    private fun parseCustomDnsServers(json: String): List<String> {
+        val out = mutableListOf<String>()
+        val array = try {
+            JSONArray(json)
+        } catch (_: Exception) {
+            JSONArray()
+        }
+
+        for (index in 0 until array.length()) {
+            val value = array.optString(index).trim()
+            val normalized = normalizeIpv4(value) ?: continue
+            if (!out.contains(normalized)) {
+                out.add(normalized)
+            }
+        }
+
+        return out
+    }
+
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -125,5 +185,10 @@ object HostRuleStore {
             out[index] = value.toByte()
         }
         return out
+    }
+
+    fun normalizeIpv4(rawIp: String): String? {
+        val ipv4 = parseIpv4(rawIp) ?: return null
+        return ipv4.joinToString(".") { byte -> (byte.toInt() and 0xFF).toString() }
     }
 }

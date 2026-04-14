@@ -4,6 +4,8 @@
     <string name="main_subtitle">Add domain to IPv4 mappings like a local hosts file.</string>
     <string name="domain_hint">Domain (example: hasan.local)</string>
     <string name="ip_hint">IPv4 (example: 192.168.6.5)</string>
+    <string name="dns_servers_hint">DNS servers (comma separated, e.g. 8.8.8.8,1.1.1.1)</string>
+    <string name="save_dns_servers">Save DNS Servers</string>
     <string name="add_rule">Save Rule</string>
     <string name="start_vpn">Start VPN</string>
     <string name="stop_vpn">Stop VPN</string>
@@ -12,8 +14,10 @@
     <string name="rules_hint">Tap Delete on a row or long press it to remove.</string>
     <string name="invalid_domain">Enter a valid domain name.</string>
     <string name="invalid_ip">Enter a valid IPv4 address.</string>
+    <string name="invalid_dns_servers">Enter valid DNS server IPv4 list (comma separated).</string>
     <string name="rule_saved">Rule saved.</string>
     <string name="rule_deleted">Rule deleted.</string>
+    <string name="dns_servers_saved">DNS server list saved.</string>
     <string name="vpn_permission_denied">VPN permission denied.</string>
     <string name="delete_rule_title">Delete rule</string>
     <string name="delete_rule_message">Delete mapping for %1$s?</string>

@@ -63,11 +63,15 @@ class MainActivity : AppCompatActivity() {
 
         setupRuleList(binding.ruleListView)
         loadRulesFromStore()
+        loadDnsServersFromStore()
         renderRules()
         renderVpnState()
 
         binding.addRuleButton.setOnClickListener {
             addOrUpdateRule()
+        }
+        binding.saveDnsButton.setOnClickListener {
+            saveDnsServersFromInput(showSuccessToast = true)
         }
 
         binding.vpnToggleButton.setOnClickListener {
@@ -82,6 +86,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         loadRulesFromStore()
+        loadDnsServersFromStore()
         renderRules()
         renderVpnState()
         warnIfPrivateDnsEnabled()
@@ -206,6 +211,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVpn() {
+        if (!saveDnsServersFromInput(showSuccessToast = false)) {
+            return
+        }
         val intent = Intent(this, HostsVpnService::class.java).apply {
             action = HostsVpnService.ACTION_START
         }
@@ -256,6 +264,57 @@ class MainActivity : AppCompatActivity() {
             LOG_TAG,
             "Rules loaded count=${rules.size} preview=${if (preview.isBlank()) "none" else preview}"
         )
+    }
+
+    private fun loadDnsServersFromStore() {
+        val servers = HostRuleStore.loadCustomDnsServers(this)
+        binding.dnsServersInput.setText(servers.joinToString(","))
+        Log.i(
+            LOG_TAG,
+            "Custom DNS loaded count=${servers.size} values=${if (servers.isEmpty()) "none" else servers.joinToString(",")}"
+        )
+    }
+
+    private fun saveDnsServersFromInput(showSuccessToast: Boolean): Boolean {
+        val raw = binding.dnsServersInput.text?.toString().orEmpty()
+        val parsedServers = parseDnsServersInput(raw) ?: run {
+            toast(R.string.invalid_dns_servers)
+            return false
+        }
+
+        HostRuleStore.saveCustomDnsServers(this, parsedServers)
+        binding.dnsServersInput.setText(parsedServers.joinToString(","))
+        Log.i(
+            LOG_TAG,
+            "Custom DNS saved count=${parsedServers.size} values=${if (parsedServers.isEmpty()) "none" else parsedServers.joinToString(",")}"
+        )
+        if (showSuccessToast) {
+            toast(R.string.dns_servers_saved)
+        }
+        return true
+    }
+
+    private fun parseDnsServersInput(raw: String): List<String>? {
+        if (raw.isBlank()) {
+            return emptyList()
+        }
+        val tokens = raw
+            .split(',', ';', ' ', '\n', '\t')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+
+        if (tokens.isEmpty()) {
+            return emptyList()
+        }
+
+        val normalized = mutableListOf<String>()
+        tokens.forEach { token ->
+            val ip = HostRuleStore.normalizeIpv4(token) ?: return null
+            if (!normalized.contains(ip)) {
+                normalized.add(ip)
+            }
+        }
+        return normalized
     }
 
     private fun warnIfPrivateDnsEnabled() {
