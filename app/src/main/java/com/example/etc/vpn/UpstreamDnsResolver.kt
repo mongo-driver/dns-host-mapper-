@@ -124,10 +124,14 @@ internal class UpstreamDnsResolver(
             return liveResponse
         }
 
-        val systemFallback = resolveUsingSystemDns(rawQuery)
-        if (systemFallback != null) {
-            cacheResponseIfEligible(queryKey, systemFallback)
-            return systemFallback
+        // System DNS fallback can block for several seconds on some networks.
+        // Only use it when no explicit upstream candidates are available.
+        if (candidates.isEmpty()) {
+            val systemFallback = resolveUsingSystemDns(rawQuery)
+            if (systemFallback != null) {
+                cacheResponseIfEligible(queryKey, systemFallback)
+                return systemFallback
+            }
         }
 
         val cachedResponse = readCachedResponse(queryKey, rawQuery)

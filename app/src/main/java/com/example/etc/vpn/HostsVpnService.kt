@@ -265,8 +265,18 @@ class HostsVpnService : VpnService() {
                 Log.i(LOG_TAG, "Forwarding DNS query upstream for $normalizedDomain")
                 val upstream = upstreamResolver?.resolve(dnsQuery)
                 if (upstream == null) {
-                    Log.w(LOG_TAG, "Upstream DNS failed for $normalizedDomain, returning SERVFAIL")
-                    DnsPacketCodec.buildServFail(parsedQuery)
+                    val shouldReturnEmpty = parsedQuery.questionType != DnsPacketCodec.TYPE_A &&
+                        parsedQuery.questionType != DnsPacketCodec.TYPE_ANY
+                    if (shouldReturnEmpty) {
+                        Log.w(
+                            LOG_TAG,
+                            "Upstream DNS failed for $normalizedDomain type=${queryTypeName(parsedQuery.questionType)}, returning empty answer"
+                        )
+                        DnsPacketCodec.buildEmptyResponse(parsedQuery)
+                    } else {
+                        Log.w(LOG_TAG, "Upstream DNS failed for $normalizedDomain, returning SERVFAIL")
+                        DnsPacketCodec.buildServFail(parsedQuery)
+                    }
                 } else {
                     upstream
                 }
