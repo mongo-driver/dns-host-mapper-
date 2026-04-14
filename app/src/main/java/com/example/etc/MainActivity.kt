@@ -10,8 +10,12 @@ import android.net.VpnService
 import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
-import android.widget.ArrayAdapter
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.BaseAdapter
 import android.widget.ListView
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -24,7 +28,7 @@ import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
-    private lateinit var ruleAdapter: ArrayAdapter<String>
+    private lateinit var ruleAdapter: BaseAdapter
     private val rules = mutableListOf<HostRule>()
     private var isReceiverRegistered = false
 
@@ -96,7 +100,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupRuleList(listView: ListView) {
-        ruleAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, mutableListOf())
+        ruleAdapter = object : BaseAdapter() {
+            override fun getCount(): Int = rules.size
+
+            override fun getItem(position: Int): HostRule = rules[position]
+
+            override fun getItemId(position: Int): Long = getItem(position).domain.hashCode().toLong()
+
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val view: View
+                val holder: RuleRowHolder
+                if (convertView == null) {
+                    view = LayoutInflater.from(parent.context)
+                        .inflate(R.layout.item_rule, parent, false)
+                    holder = RuleRowHolder(
+                        domainView = view.findViewById(R.id.ruleDomainText),
+                        ipView = view.findViewById(R.id.ruleIpText),
+                        removeButton = view.findViewById(R.id.removeRuleButton)
+                    )
+                    view.tag = holder
+                } else {
+                    view = convertView
+                    holder = convertView.tag as RuleRowHolder
+                }
+
+                val rule = getItem(position)
+                holder.domainView.text = rule.domain
+                holder.ipView.text = rule.ip
+                holder.removeButton.setOnClickListener {
+                    showDeleteRuleDialog(rule)
+                }
+                return view
+            }
+        }
         listView.adapter = ruleAdapter
         listView.emptyView = binding.emptyView
         listView.setOnItemLongClickListener { _, _, position, _ ->
@@ -112,13 +148,17 @@ class MainActivity : AppCompatActivity() {
             .setMessage(getString(R.string.delete_rule_message, rule.domain))
             .setNegativeButton(R.string.cancel, null)
             .setPositiveButton(R.string.delete) { _, _ ->
-                rules.remove(rule)
-                HostRuleStore.saveRules(this, rules)
-                loadRulesFromStore()
-                renderRules()
-                toast(R.string.rule_deleted)
+                deleteRule(rule)
             }
             .show()
+    }
+
+    private fun deleteRule(rule: HostRule) {
+        rules.remove(rule)
+        HostRuleStore.saveRules(this, rules)
+        loadRulesFromStore()
+        renderRules()
+        toast(R.string.rule_deleted)
     }
 
     private fun addOrUpdateRule() {
@@ -196,11 +236,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderRules() {
-        val lines = rules.map { rule ->
-            "${rule.domain} -> ${rule.ip}"
-        }
-        ruleAdapter.clear()
-        ruleAdapter.addAll(lines)
         ruleAdapter.notifyDataSetChanged()
     }
 
@@ -297,4 +332,10 @@ class MainActivity : AppCompatActivity() {
         private const val PRIVATE_DNS_MODE_KEY = "private_dns_mode"
         private const val PRIVATE_DNS_MODE_OFF = "off"
     }
+
+    private data class RuleRowHolder(
+        val domainView: TextView,
+        val ipView: TextView,
+        val removeButton: View
+    )
 }

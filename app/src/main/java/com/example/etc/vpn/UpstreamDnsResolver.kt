@@ -388,12 +388,17 @@ internal class UpstreamDnsResolver(
         val seenHosts = linkedSetOf<String>()
 
         val manager = connectivityManager
-        if (manager != null) {
-            val activeNetwork = try {
+        val activeNetwork = if (manager != null) {
+            try {
                 manager.activeNetwork
             } catch (_: Exception) {
                 null
             }
+        } else {
+            null
+        }
+
+        if (manager != null) {
             val networks = try {
                 manager.allNetworks.toList()
             } catch (_: SecurityException) {
@@ -416,9 +421,6 @@ internal class UpstreamDnsResolver(
                     return@forEach
                 }
                 if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
-                    return@forEach
-                }
-                if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
                     return@forEach
                 }
 
@@ -459,35 +461,38 @@ internal class UpstreamDnsResolver(
             }
         }
 
-        if (manager != null) {
-            val activeNetwork = try {
-                manager.activeNetwork
+        val canBindToActiveNetwork = if (manager != null && activeNetwork != null) {
+            val activeCaps = try {
+                manager.getNetworkCapabilities(activeNetwork)
             } catch (_: Exception) {
                 null
             }
-            if (activeNetwork != null) {
-                val activeCaps = try {
-                    manager.getNetworkCapabilities(activeNetwork)
-                } catch (_: Exception) {
-                    null
+            activeCaps != null &&
+                !activeCaps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                activeCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } else {
+            false
+        }
+
+        if (canBindToActiveNetwork && activeNetwork != null) {
+            extraResolvers.forEach { dns ->
+                val host = dns.hostAddress ?: return@forEach
+                if (host == VPN_DNS_ADDRESS) {
+                    return@forEach
                 }
-                if (activeCaps == null ||
-                    activeCaps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
-                    !activeCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ||
-                    !activeCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                ) {
-                    return prioritizeCandidates(all)
-                }
-                extraResolvers.forEach { dns ->
-                    val host = dns.hostAddress ?: return@forEach
-                    if (host == VPN_DNS_ADDRESS) {
-                        return@forEach
-                    }
-                    if (seenHosts.add(host)) {
-                        all.add(UpstreamCandidate(network = activeNetwork, dnsServer = dns))
-                    }
+                if (seenHosts.add(host)) {
+                    all.add(UpstreamCandidate(network = activeNetwork, dnsServer = dns))
                 }
             }
+        }
+
+        // Always keep protected fallback resolvers so DNS still works when network-bound discovery fails.
+        extraResolvers.forEach { dns ->
+            val host = dns.hostAddress ?: return@forEach
+            if (host == VPN_DNS_ADDRESS) {
+                return@forEach
+            }
+            all.add(UpstreamCandidate(network = null, dnsServer = dns))
         }
 
         return prioritizeCandidates(all)
@@ -582,9 +587,6 @@ internal class UpstreamDnsResolver(
                 continue
             }
             if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
-                continue
-            }
-            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
                 continue
             }
 

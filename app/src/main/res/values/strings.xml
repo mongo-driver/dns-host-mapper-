@@ -9,7 +9,7 @@
     <string name="stop_vpn">Stop VPN</string>
     <string name="rules_label">Saved Rules</string>
     <string name="rules_empty">No rules yet. Add one above.</string>
-    <string name="rules_hint">Long press a rule to delete it.</string>
+    <string name="rules_hint">Tap Delete on a row or long press it to remove.</string>
     <string name="invalid_domain">Enter a valid domain name.</string>
     <string name="invalid_ip">Enter a valid IPv4 address.</string>
     <string name="rule_saved">Rule saved.</string>
