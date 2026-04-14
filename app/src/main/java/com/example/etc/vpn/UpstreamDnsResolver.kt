@@ -241,10 +241,6 @@ internal class UpstreamDnsResolver(
             e
         }
 
-        if (udpError is SocketTimeoutException) {
-            throw udpError
-        }
-
         Log.w(
             LOG_TAG,
             "UDP upstream failed for ${candidateHost(candidate)} (${udpError.message}), trying TCP fallback"
@@ -833,8 +829,8 @@ internal class UpstreamDnsResolver(
         private const val DNS_PORT = 53
         private const val VPN_DNS_ADDRESS = "10.9.0.1"
         private const val SINGLE_QUERY_TIMEOUT_MS = 1500
-        private const val TCP_CONNECT_TIMEOUT_MS = 2000
-        private const val TCP_QUERY_TIMEOUT_MS = 2500
+        private const val TCP_CONNECT_TIMEOUT_MS = 1200
+        private const val TCP_QUERY_TIMEOUT_MS = 1500
         private const val MAX_PARALLEL_QUERIES = 4
         private const val MIN_READY_CANDIDATES = 2
         private val NETWORK_FALLBACK_DNS = arrayOf("8.8.8.8", "1.1.1.1", "9.9.9.9")
