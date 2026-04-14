@@ -20,6 +20,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.textfield.TextInputEditText
 import com.example.etc.data.HostRule
 import com.example.etc.data.HostRuleStore
 import com.example.etc.databinding.ActivityMainBinding
@@ -70,8 +71,8 @@ class MainActivity : AppCompatActivity() {
         binding.addRuleButton.setOnClickListener {
             addOrUpdateRule()
         }
-        binding.saveDnsButton.setOnClickListener {
-            saveDnsServersFromInput(showSuccessToast = true)
+        binding.manageDnsServersButton.setOnClickListener {
+            showManageDnsServersDialog()
         }
 
         binding.vpnToggleButton.setOnClickListener {
@@ -211,9 +212,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVpn() {
-        if (!saveDnsServersFromInput(showSuccessToast = false)) {
-            return
-        }
         val intent = Intent(this, HostsVpnService::class.java).apply {
             action = HostsVpnService.ACTION_START
         }
@@ -268,53 +266,129 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadDnsServersFromStore() {
         val servers = HostRuleStore.loadCustomDnsServers(this)
-        binding.dnsServersInput.setText(servers.joinToString(","))
+        binding.dnsServersValue.text = if (servers.isEmpty()) {
+            getString(R.string.dns_servers_none)
+        } else {
+            servers.joinToString(", ")
+        }
         Log.i(
             LOG_TAG,
             "Custom DNS loaded count=${servers.size} values=${if (servers.isEmpty()) "none" else servers.joinToString(",")}"
         )
     }
 
-    private fun saveDnsServersFromInput(showSuccessToast: Boolean): Boolean {
-        val raw = binding.dnsServersInput.text?.toString().orEmpty()
-        val parsedServers = parseDnsServersInput(raw) ?: run {
-            toast(R.string.invalid_dns_servers)
-            return false
-        }
+    private fun showManageDnsServersDialog() {
+        val draftServers = HostRuleStore.loadCustomDnsServers(this).toMutableList()
+        val dialogView = layoutInflater.inflate(R.layout.dialog_dns_servers, null)
+        val input = dialogView.findViewById<TextInputEditText>(R.id.dnsServerInput)
+        val addButton = dialogView.findViewById<View>(R.id.addDnsServerButton)
+        val listView = dialogView.findViewById<ListView>(R.id.dnsServerListView)
+        val emptyView = dialogView.findViewById<View>(R.id.dnsServerEmptyView)
 
-        HostRuleStore.saveCustomDnsServers(this, parsedServers)
-        binding.dnsServersInput.setText(parsedServers.joinToString(","))
-        Log.i(
-            LOG_TAG,
-            "Custom DNS saved count=${parsedServers.size} values=${if (parsedServers.isEmpty()) "none" else parsedServers.joinToString(",")}"
-        )
-        if (showSuccessToast) {
-            toast(R.string.dns_servers_saved)
-        }
-        return true
-    }
+        val dnsAdapter = object : BaseAdapter() {
+            override fun getCount(): Int = draftServers.size
 
-    private fun parseDnsServersInput(raw: String): List<String>? {
-        if (raw.isBlank()) {
-            return emptyList()
-        }
-        val tokens = raw
-            .split(',', ';', ' ', '\n', '\t')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
+            override fun getItem(position: Int): String = draftServers[position]
 
-        if (tokens.isEmpty()) {
-            return emptyList()
-        }
+            override fun getItemId(position: Int): Long = getItem(position).hashCode().toLong()
 
-        val normalized = mutableListOf<String>()
-        tokens.forEach { token ->
-            val ip = HostRuleStore.normalizeIpv4(token) ?: return null
-            if (!normalized.contains(ip)) {
-                normalized.add(ip)
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val view: View
+                val holder: DnsServerRowHolder
+                if (convertView == null) {
+                    view = LayoutInflater.from(parent.context)
+                        .inflate(R.layout.item_dns_server, parent, false)
+                    holder = DnsServerRowHolder(
+                        dnsView = view.findViewById(R.id.dnsServerText),
+                        editView = view.findViewById(R.id.editDnsServerButton),
+                        removeView = view.findViewById(R.id.removeDnsServerButton)
+                    )
+                    view.tag = holder
+                } else {
+                    view = convertView
+                    holder = convertView.tag as DnsServerRowHolder
+                }
+
+                val dnsValue = getItem(position)
+                holder.dnsView.text = dnsValue
+                holder.editView.setOnClickListener {
+                    showEditDnsServerDialog(currentValue = dnsValue) { updated ->
+                        if (updated == dnsValue) {
+                            return@showEditDnsServerDialog
+                        }
+                        if (draftServers.contains(updated)) {
+                            toast(R.string.dns_server_exists)
+                            return@showEditDnsServerDialog
+                        }
+                        val index = draftServers.indexOf(dnsValue)
+                        if (index >= 0) {
+                            draftServers[index] = updated
+                            notifyDataSetChanged()
+                            toast(R.string.dns_server_updated)
+                        }
+                    }
+                }
+                holder.removeView.setOnClickListener {
+                    val index = draftServers.indexOf(dnsValue)
+                    if (index >= 0) {
+                        draftServers.removeAt(index)
+                        notifyDataSetChanged()
+                        toast(R.string.dns_server_deleted)
+                    }
+                }
+                return view
             }
         }
-        return normalized
+
+        listView.adapter = dnsAdapter
+        listView.emptyView = emptyView
+
+        addButton.setOnClickListener {
+            val normalized = HostRuleStore.normalizeIpv4(input.text?.toString().orEmpty()) ?: run {
+                toast(R.string.invalid_dns_server)
+                return@setOnClickListener
+            }
+            if (draftServers.contains(normalized)) {
+                toast(R.string.dns_server_exists)
+                return@setOnClickListener
+            }
+            draftServers.add(normalized)
+            dnsAdapter.notifyDataSetChanged()
+            input.text?.clear()
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.manage_dns_servers)
+            .setView(dialogView)
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.save) { _, _ ->
+                HostRuleStore.saveCustomDnsServers(this, draftServers)
+                loadDnsServersFromStore()
+                toast(R.string.dns_servers_saved)
+            }
+            .show()
+    }
+
+    private fun showEditDnsServerDialog(
+        currentValue: String,
+        onSave: (String) -> Unit
+    ) {
+        val editInput = TextInputEditText(this).apply {
+            setText(currentValue)
+            hint = getString(R.string.dns_server_single_hint)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.edit_dns_server_title)
+            .setView(editInput)
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.save) { _, _ ->
+                val normalized = HostRuleStore.normalizeIpv4(editInput.text?.toString().orEmpty()) ?: run {
+                    toast(R.string.invalid_dns_server)
+                    return@setPositiveButton
+                }
+                onSave(normalized)
+            }
+            .show()
     }
 
     private fun warnIfPrivateDnsEnabled() {
@@ -396,5 +470,11 @@ class MainActivity : AppCompatActivity() {
         val domainView: TextView,
         val ipView: TextView,
         val removeButton: View
+    )
+
+    private data class DnsServerRowHolder(
+        val dnsView: TextView,
+        val editView: View,
+        val removeView: View
     )
 }

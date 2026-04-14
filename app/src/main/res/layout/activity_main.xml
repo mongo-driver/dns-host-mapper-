@@ -54,28 +54,30 @@
             android:maxLength="15" />
     </com.google.android.material.textfield.TextInputLayout>
 
-    <com.google.android.material.textfield.TextInputLayout
+    <TextView
+        android:id="@+id/dnsServersLabel"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        app:boxBackgroundMode="outline">
+        android:layout_marginTop="10dp"
+        android:text="@string/dns_servers_label"
+        android:textAppearance="@style/TextAppearance.MaterialComponents.Subtitle2"
+        android:textStyle="bold" />
 
-        <com.google.android.material.textfield.TextInputEditText
-            android:id="@+id/dnsServersInput"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="@string/dns_servers_hint"
-            android:imeOptions="actionDone"
-            android:inputType="textNoSuggestions" />
-    </com.google.android.material.textfield.TextInputLayout>
+    <TextView
+        android:id="@+id/dnsServersValue"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="@string/dns_servers_none"
+        android:textAppearance="@style/TextAppearance.MaterialComponents.Body2" />
 
     <com.google.android.material.button.MaterialButton
-        android:id="@+id/saveDnsButton"
+        android:id="@+id/manageDnsServersButton"
         style="@style/Widget.MaterialComponents.Button.OutlinedButton"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="@string/save_dns_servers" />
+        android:text="@string/manage_dns_servers" />
 
     <LinearLayout
         android:layout_width="match_parent"
