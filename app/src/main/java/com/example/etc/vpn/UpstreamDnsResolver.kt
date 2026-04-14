@@ -21,6 +21,9 @@ import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.math.max
 import kotlin.math.min
 
@@ -101,6 +104,7 @@ internal class UpstreamDnsResolver(
     private val connectivityManager =
         vpnService.getSystemService(ConnectivityManager::class.java)
     private val queryExecutor: ExecutorService = Executors.newFixedThreadPool(MAX_PARALLEL_QUERIES)
+    private val systemFallbackExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val responseCache = object : LinkedHashMap<String, CachedResponse>(MAX_CACHE_ENTRIES, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedResponse>?): Boolean {
             return size > MAX_CACHE_ENTRIES
@@ -124,14 +128,15 @@ internal class UpstreamDnsResolver(
             return liveResponse
         }
 
-        // System DNS fallback can block for several seconds on some networks.
-        // Only use it when no explicit upstream candidates are available.
-        if (candidates.isEmpty()) {
-            val systemFallback = resolveUsingSystemDns(rawQuery)
-            if (systemFallback != null) {
-                cacheResponseIfEligible(queryKey, systemFallback)
-                return systemFallback
-            }
+        val systemFallbackTimeoutMs = if (candidates.isEmpty()) {
+            SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS
+        } else {
+            SYSTEM_FALLBACK_TIMEOUT_MS
+        }
+        val systemFallback = resolveUsingSystemDnsWithTimeout(rawQuery, systemFallbackTimeoutMs)
+        if (systemFallback != null) {
+            cacheResponseIfEligible(queryKey, systemFallback)
+            return systemFallback
         }
 
         val cachedResponse = readCachedResponse(queryKey, rawQuery)
@@ -145,6 +150,25 @@ internal class UpstreamDnsResolver(
 
     fun close() {
         queryExecutor.shutdownNow()
+        systemFallbackExecutor.shutdownNow()
+    }
+
+    private fun resolveUsingSystemDnsWithTimeout(rawQuery: ByteArray, timeoutMs: Long): ByteArray? {
+        val future = try {
+            systemFallbackExecutor.submit<ByteArray?> { resolveUsingSystemDns(rawQuery) }
+        } catch (_: RejectedExecutionException) {
+            return null
+        }
+
+        return try {
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: TimeoutException) {
+            future.cancel(true)
+            null
+        } catch (_: Exception) {
+            future.cancel(true)
+            null
+        }
     }
 
     private fun queryCandidatesParallel(rawQuery: ByteArray, candidates: List<UpstreamCandidate>): ByteArray? {
@@ -890,7 +914,9 @@ internal class UpstreamDnsResolver(
         private const val TCP_CONNECT_TIMEOUT_MS = 1200
         private const val TCP_QUERY_TIMEOUT_MS = 1500
         private const val MAX_PARALLEL_QUERIES = 4
-        private const val MIN_READY_CANDIDATES = 2
+        // Keep a wider fallback set even when some candidates are cooling down.
+        // This improves resilience when one DNS intermittently refuses connections.
+        private const val MIN_READY_CANDIDATES = 4
         private val NETWORK_FALLBACK_DNS = arrayOf("8.8.8.8", "1.1.1.1", "9.9.9.9")
         private const val PRIORITY_CUSTOM = 0
         private const val PRIORITY_NETWORK_DISCOVERED = 10
@@ -906,5 +932,7 @@ internal class UpstreamDnsResolver(
         private const val CANDIDATE_COOLDOWN_MS = 20_000L
         private const val CANDIDATE_LONG_COOLDOWN_MS = 120_000L
         private const val COLD_START_FAILURE_THRESHOLD = 3
+        private const val SYSTEM_FALLBACK_TIMEOUT_MS = 800L
+        private const val SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS = 2000L
     }
 }
