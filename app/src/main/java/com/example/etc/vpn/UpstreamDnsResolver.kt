@@ -116,6 +116,7 @@ internal class UpstreamDnsResolver(
     private val candidateConsecutiveFailures = mutableMapOf<String, Int>()
     private val candidateSuccessCount = mutableMapOf<String, Int>()
     private val candidateTcpDisabledUntilMs = mutableMapOf<String, Long>()
+    private val createdAtMs = System.currentTimeMillis()
 
     @Volatile
     private var privateDnsWarningLogged = false
@@ -265,7 +266,11 @@ internal class UpstreamDnsResolver(
         onUdpSocketCreated: ((DatagramSocket) -> Unit)? = null,
         onTcpSocketCreated: ((Socket) -> Unit)? = null
     ): ByteArray {
-        val maxUdpAttempts = if (hasCandidateSuccess(candidate)) UDP_RETRY_ATTEMPTS_FOR_WARM_CANDIDATE else 1
+        val maxUdpAttempts = when {
+            hasCandidateSuccess(candidate) -> UDP_RETRY_ATTEMPTS_FOR_WARM_CANDIDATE
+            isWithinStartupWarmupWindow() -> UDP_RETRY_ATTEMPTS_DURING_STARTUP
+            else -> 1
+        }
         var udpError: Exception? = null
         repeat(maxUdpAttempts) { attempt ->
             try {
@@ -409,6 +414,7 @@ internal class UpstreamDnsResolver(
 
         val failureCount: Int
         val hasSuccess: Boolean
+        val inStartupWarmupWindow = isWithinStartupWarmupWindow()
         synchronized(candidateCooldownUntilMs) {
             failureCount = (candidateConsecutiveFailures[host] ?: 0) + 1
             candidateConsecutiveFailures[host] = failureCount
@@ -424,7 +430,9 @@ internal class UpstreamDnsResolver(
                         0L
                     }
                 } else {
-                    if (failureCount >= COLD_START_FAILURE_THRESHOLD) {
+                    if (inStartupWarmupWindow && failureCount <= STARTUP_WARMUP_FAILURE_THRESHOLD) {
+                        0L
+                    } else if (failureCount >= COLD_START_FAILURE_THRESHOLD) {
                         CANDIDATE_LONG_COOLDOWN_MS
                     } else {
                         CANDIDATE_COOLDOWN_MS
@@ -966,6 +974,10 @@ internal class UpstreamDnsResolver(
         }
     }
 
+    private fun isWithinStartupWarmupWindow(): Boolean {
+        return System.currentTimeMillis() - createdAtMs <= STARTUP_WARMUP_WINDOW_MS
+    }
+
     private fun isTruncatedDnsResponse(packet: ByteArray): Boolean {
         if (packet.size < DNS_HEADER_SIZE) {
             return false
@@ -1055,6 +1067,9 @@ internal class UpstreamDnsResolver(
         private const val WARM_PATH_FAILURE_THRESHOLD = 3
         private const val WARM_PATH_COOLDOWN_MS = 5_000L
         private const val TCP_FALLBACK_DISABLE_MS = 600_000L
+        private const val STARTUP_WARMUP_WINDOW_MS = 20_000L
+        private const val STARTUP_WARMUP_FAILURE_THRESHOLD = 2
+        private const val UDP_RETRY_ATTEMPTS_DURING_STARTUP = 2
         private const val UDP_RETRY_ATTEMPTS_FOR_WARM_CANDIDATE = 2
         private const val SYSTEM_FALLBACK_TIMEOUT_MS = 4000L
         private const val SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS = 6000L
