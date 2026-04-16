@@ -30,6 +30,8 @@ import kotlin.math.min
 internal class UpstreamDnsResolver(
     private val vpnService: VpnService
 ) {
+    private class UdpTruncatedException : IOException("UDP DNS response truncated (TC=1)")
+
     private data class InFlightQuery(
         val future: Future<QueryResult>,
         val task: CandidateQueryTask
@@ -113,6 +115,7 @@ internal class UpstreamDnsResolver(
     private val candidateCooldownUntilMs = mutableMapOf<String, Long>()
     private val candidateConsecutiveFailures = mutableMapOf<String, Int>()
     private val candidateSuccessCount = mutableMapOf<String, Int>()
+    private val candidateTcpDisabledUntilMs = mutableMapOf<String, Long>()
 
     @Volatile
     private var privateDnsWarningLogged = false
@@ -271,14 +274,25 @@ internal class UpstreamDnsResolver(
             e
         }
 
+        if (!shouldTryTcpFallback(candidate, udpError)) {
+            throw udpError
+        }
+
         Log.w(
             LOG_TAG,
             "UDP upstream failed for ${candidateHost(candidate)} (${udpError.message}), trying TCP fallback"
         )
 
         try {
-            return querySingleCandidateTcp(candidate, rawQuery, onTcpSocketCreated)
+            val tcpResponse = querySingleCandidateTcp(candidate, rawQuery, onTcpSocketCreated)
+            synchronized(candidateCooldownUntilMs) {
+                candidateTcpDisabledUntilMs.remove(candidateHost(candidate))
+            }
+            return tcpResponse
         } catch (tcpError: Exception) {
+            if (isTcpRefusedLike(tcpError)) {
+                temporarilyDisableTcpFallback(candidate)
+            }
             tcpError.addSuppressed(udpError)
             throw tcpError
         }
@@ -307,7 +321,11 @@ internal class UpstreamDnsResolver(
             val responseBuffer = ByteArray(MAX_DNS_PACKET_SIZE)
             val response = DatagramPacket(responseBuffer, responseBuffer.size)
             socket.receive(response)
-            return response.data.copyOf(response.length)
+            val payload = response.data.copyOf(response.length)
+            if (isTruncatedDnsResponse(payload)) {
+                throw UdpTruncatedException()
+            }
+            return payload
         }
     }
 
@@ -365,6 +383,7 @@ internal class UpstreamDnsResolver(
             candidateCooldownUntilMs.remove(host)
             candidateConsecutiveFailures.remove(host)
             candidateSuccessCount[host] = (candidateSuccessCount[host] ?: 0) + 1
+            candidateTcpDisabledUntilMs.remove(host)
         }
     }
 
@@ -374,8 +393,9 @@ internal class UpstreamDnsResolver(
         }
         val host = candidateHost(candidate)
         val message = error?.message ?: "unknown"
-        val isTimeoutLike = error is SocketTimeoutException || message.contains("timed out", ignoreCase = true)
-        val isBindLike = error is BindException || message.contains("bind failed", ignoreCase = true)
+        val isTimeoutLike = error != null && isTimeoutLike(error)
+        val isBindLike = error != null && isBindLike(error)
+        val isRefusedLike = error != null && isTcpRefusedLike(error)
 
         val failureCount: Int
         val hasSuccess: Boolean
@@ -387,11 +407,24 @@ internal class UpstreamDnsResolver(
 
         val cooldownMs = when {
             isTimeoutLike || isBindLike -> {
-                if (!hasSuccess && failureCount >= COLD_START_FAILURE_THRESHOLD) {
-                    CANDIDATE_LONG_COOLDOWN_MS
+                if (hasSuccess) {
+                    if (failureCount >= WARM_PATH_FAILURE_THRESHOLD) {
+                        WARM_PATH_COOLDOWN_MS
+                    } else {
+                        0L
+                    }
                 } else {
-                    CANDIDATE_COOLDOWN_MS
+                    if (failureCount >= COLD_START_FAILURE_THRESHOLD) {
+                        CANDIDATE_LONG_COOLDOWN_MS
+                    } else {
+                        CANDIDATE_COOLDOWN_MS
+                    }
                 }
+            }
+
+            isRefusedLike -> {
+                temporarilyDisableTcpFallback(candidate)
+                if (hasSuccess) 0L else CANDIDATE_COOLDOWN_MS
             }
 
             else -> 0L
@@ -405,6 +438,7 @@ internal class UpstreamDnsResolver(
         val errorLabel = when {
             isTimeoutLike -> "Poll timed out"
             isBindLike -> "bind failed"
+            isRefusedLike -> "Connection refused"
             else -> message
         }
         Log.w(
@@ -612,6 +646,12 @@ internal class UpstreamDnsResolver(
             (cooldownSnapshot[host] ?: 0L) <= now
         }
         if (ready.isNotEmpty()) {
+            val readyWithSuccess = ready.filter { candidate ->
+                (successSnapshot[candidateHost(candidate)] ?: 0) > 0
+            }
+            if (readyWithSuccess.isNotEmpty()) {
+                return readyWithSuccess
+            }
             if (ready.size >= MIN_READY_CANDIDATES) {
                 return ready
             }
@@ -853,6 +893,63 @@ internal class UpstreamDnsResolver(
         return true
     }
 
+    private fun isTimeoutLike(error: Exception): Boolean {
+        val message = error.message?.lowercase(Locale.US).orEmpty()
+        return error is SocketTimeoutException || message.contains("timed out")
+    }
+
+    private fun isBindLike(error: Exception): Boolean {
+        val message = error.message?.lowercase(Locale.US).orEmpty()
+        return error is BindException || message.contains("bind failed")
+    }
+
+    private fun isTcpRefusedLike(error: Exception): Boolean {
+        val message = error.message?.lowercase(Locale.US).orEmpty()
+        return message.contains("connection refused") || message.contains("econnrefused")
+    }
+
+    private fun shouldTryTcpFallback(candidate: UpstreamCandidate, udpError: Exception): Boolean {
+        if (udpError is UdpTruncatedException) {
+            return !isTcpFallbackDisabled(candidate)
+        }
+        if (isTimeoutLike(udpError)) {
+            return false
+        }
+        if (isTcpRefusedLike(udpError)) {
+            temporarilyDisableTcpFallback(candidate)
+            return false
+        }
+        return !isTcpFallbackDisabled(candidate)
+    }
+
+    private fun isTcpFallbackDisabled(candidate: UpstreamCandidate): Boolean {
+        val host = candidateHost(candidate)
+        val now = System.currentTimeMillis()
+        synchronized(candidateCooldownUntilMs) {
+            val until = candidateTcpDisabledUntilMs[host] ?: return false
+            if (until <= now) {
+                candidateTcpDisabledUntilMs.remove(host)
+                return false
+            }
+            return true
+        }
+    }
+
+    private fun temporarilyDisableTcpFallback(candidate: UpstreamCandidate) {
+        val host = candidateHost(candidate)
+        synchronized(candidateCooldownUntilMs) {
+            candidateTcpDisabledUntilMs[host] = System.currentTimeMillis() + TCP_FALLBACK_DISABLE_MS
+        }
+    }
+
+    private fun isTruncatedDnsResponse(packet: ByteArray): Boolean {
+        if (packet.size < DNS_HEADER_SIZE) {
+            return false
+        }
+        val flags = readU16(packet, 2)
+        return (flags and 0x0200) != 0
+    }
+
     private fun isCancellationLike(error: Exception): Boolean {
         if (error is CancellationException) {
             return true
@@ -914,9 +1011,8 @@ internal class UpstreamDnsResolver(
         private const val TCP_CONNECT_TIMEOUT_MS = 1200
         private const val TCP_QUERY_TIMEOUT_MS = 1500
         private const val MAX_PARALLEL_QUERIES = 4
-        // Keep a wider fallback set even when some candidates are cooling down.
-        // This improves resilience when one DNS intermittently refuses connections.
-        private const val MIN_READY_CANDIDATES = 4
+        // Keep one warm standby without forcing every cooled resolver on each query.
+        private const val MIN_READY_CANDIDATES = 2
         private val NETWORK_FALLBACK_DNS = arrayOf("8.8.8.8", "1.1.1.1", "9.9.9.9")
         private const val PRIORITY_CUSTOM = 0
         private const val PRIORITY_NETWORK_DISCOVERED = 10
@@ -932,7 +1028,10 @@ internal class UpstreamDnsResolver(
         private const val CANDIDATE_COOLDOWN_MS = 20_000L
         private const val CANDIDATE_LONG_COOLDOWN_MS = 120_000L
         private const val COLD_START_FAILURE_THRESHOLD = 3
-        private const val SYSTEM_FALLBACK_TIMEOUT_MS = 800L
-        private const val SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS = 2000L
+        private const val WARM_PATH_FAILURE_THRESHOLD = 3
+        private const val WARM_PATH_COOLDOWN_MS = 5_000L
+        private const val TCP_FALLBACK_DISABLE_MS = 600_000L
+        private const val SYSTEM_FALLBACK_TIMEOUT_MS = 1200L
+        private const val SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS = 2500L
     }
 }

@@ -8,6 +8,7 @@ import com.example.etc.data.HostRuleStore
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
 
 class HostsVpnService : VpnService() {
     private data class TunnelUdpPacket(
@@ -24,9 +25,13 @@ class HostsVpnService : VpnService() {
     private var upstreamResolver: UpstreamDnsResolver? = null
     private var mdnsLocalResponder: MdnsLocalResponder? = null
     private var ipv6PacketCounter = 0
+    private val sessionCounter = AtomicLong(0L)
 
     @Volatile
     private var active = false
+
+    @Volatile
+    private var activeSessionId = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(LOG_TAG, "onStartCommand action=${intent?.action ?: "null"} active=$active")
@@ -95,25 +100,26 @@ class HostsVpnService : VpnService() {
         }
 
         tunnelInterface = iface
+        val sessionId = sessionCounter.incrementAndGet()
+        activeSessionId = sessionId
         upstreamResolver = UpstreamDnsResolver(this)
         mdnsLocalResponder = MdnsLocalResponder(this, this).also { it.start() }
         active = true
         publishVpnState(true)
-        Log.i(LOG_TAG, "VPN established and active")
+        Log.i(LOG_TAG, "VPN established and active session=$sessionId")
 
         tunnelThread = Thread(
-            { runTunnelLoop() },
+            { runTunnelLoop(sessionId, iface) },
             "dns-host-mapper-vpn-loop"
         ).apply { start() }
     }
 
-    private fun runTunnelLoop() {
-        val iface = tunnelInterface ?: return
+    private fun runTunnelLoop(sessionId: Long, iface: ParcelFileDescriptor) {
         try {
             FileInputStream(iface.fileDescriptor).use { input ->
                 FileOutputStream(iface.fileDescriptor).use { output ->
                     val packetBuffer = ByteArray(VPN_MTU * 2)
-                    while (active) {
+                    while (active && activeSessionId == sessionId) {
                         val readBytes = try {
                             input.read(packetBuffer)
                         } catch (e: Exception) {
@@ -137,10 +143,13 @@ class HostsVpnService : VpnService() {
                 }
             }
         } finally {
-            active = false
-            publishVpnState(false)
-            closeTunnelInterface()
-            Log.i(LOG_TAG, "runTunnelLoop finished")
+            if (activeSessionId == sessionId) {
+                active = false
+                activeSessionId = 0L
+                publishVpnState(false)
+            }
+            closeTunnelInterface(iface)
+            Log.i(LOG_TAG, "runTunnelLoop finished session=$sessionId")
         }
     }
 
@@ -313,6 +322,7 @@ class HostsVpnService : VpnService() {
     private fun stopVpn() {
         Log.i(LOG_TAG, "stopVpn called")
         active = false
+        activeSessionId = 0L
         tunnelThread?.interrupt()
         tunnelThread = null
         closeTunnelInterface()
@@ -323,16 +333,18 @@ class HostsVpnService : VpnService() {
         publishVpnState(false)
     }
 
-    private fun closeTunnelInterface() {
-        val iface = tunnelInterface
-        tunnelInterface = null
-        if (iface != null) {
-            try {
-                iface.close()
-            } catch (e: Exception) {
-                // Ignore close errors.
-                Log.w(LOG_TAG, "closeTunnelInterface failed", e)
+    private fun closeTunnelInterface(target: ParcelFileDescriptor? = tunnelInterface) {
+        val iface = target ?: return
+        synchronized(this) {
+            if (tunnelInterface === iface) {
+                tunnelInterface = null
             }
+        }
+        try {
+            iface.close()
+        } catch (e: Exception) {
+            // Ignore close errors/races.
+            Log.w(LOG_TAG, "closeTunnelInterface failed", e)
         }
     }
 
