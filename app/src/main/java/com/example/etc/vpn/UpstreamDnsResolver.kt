@@ -56,7 +56,8 @@ internal class UpstreamDnsResolver(
 
     private inner class CandidateQueryTask(
         private val candidate: UpstreamCandidate,
-        private val rawQuery: ByteArray
+        private val rawQuery: ByteArray,
+        private val udpAttemptLimit: Int
     ) : Callable<QueryResult> {
         @Volatile
         private var cancelled = false
@@ -72,6 +73,7 @@ internal class UpstreamDnsResolver(
                 val response = querySingleCandidate(
                     candidate = candidate,
                     rawQuery = rawQuery,
+                    maxUdpAttempts = udpAttemptLimit,
                     onUdpSocketCreated = { socket -> udpSocket = socket },
                     onTcpSocketCreated = { socket -> tcpSocket = socket }
                 )
@@ -126,30 +128,38 @@ internal class UpstreamDnsResolver(
         val candidates = findDnsCandidates()
         Log.i(LOG_TAG, "Upstream resolver candidates=${candidates.joinToString(",") { candidateLabel(it) }}")
 
-        val liveResponse = queryCandidatesParallel(rawQuery, candidates)
-        if (liveResponse != null) {
-            cacheResponseIfEligible(queryKey, liveResponse)
-            return liveResponse
-        }
-
         val systemFallbackTimeoutMs = if (candidates.isEmpty()) {
             SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS
         } else {
             SYSTEM_FALLBACK_TIMEOUT_MS
         }
-        val systemFallback = resolveUsingSystemDnsWithTimeout(rawQuery, systemFallbackTimeoutMs)
-        if (systemFallback != null) {
-            cacheResponseIfEligible(queryKey, systemFallback)
-            return systemFallback
-        }
+        val systemFallbackFuture = submitSystemFallback(rawQuery)
 
-        val cachedResponse = readCachedResponse(queryKey, rawQuery)
-        if (cachedResponse != null) {
-            return cachedResponse
-        }
+        try {
+            val liveResponse = queryCandidatesParallel(rawQuery, candidates)
+            if (liveResponse != null) {
+                cacheResponseIfEligible(queryKey, liveResponse)
+                return liveResponse
+            }
 
-        Log.w(LOG_TAG, "Upstream resolver returned null response")
-        return null
+            val systemFallback = awaitSystemFallback(systemFallbackFuture, systemFallbackTimeoutMs)
+            if (systemFallback != null) {
+                cacheResponseIfEligible(queryKey, systemFallback)
+                return systemFallback
+            }
+
+            val cachedResponse = readCachedResponse(queryKey, rawQuery)
+            if (cachedResponse != null) {
+                return cachedResponse
+            }
+
+            Log.w(LOG_TAG, "Upstream resolver returned null response")
+            return null
+        } finally {
+            if (systemFallbackFuture != null && !systemFallbackFuture.isDone) {
+                systemFallbackFuture.cancel(true)
+            }
+        }
     }
 
     fun close() {
@@ -157,13 +167,18 @@ internal class UpstreamDnsResolver(
         systemFallbackExecutor.shutdownNow()
     }
 
-    private fun resolveUsingSystemDnsWithTimeout(rawQuery: ByteArray, timeoutMs: Long): ByteArray? {
-        val future = try {
+    private fun submitSystemFallback(rawQuery: ByteArray): Future<ByteArray?>? {
+        return try {
             systemFallbackExecutor.submit<ByteArray?> { resolveUsingSystemDns(rawQuery) }
         } catch (_: RejectedExecutionException) {
+            null
+        }
+    }
+
+    private fun awaitSystemFallback(future: Future<ByteArray?>?, timeoutMs: Long): ByteArray? {
+        if (future == null) {
             return null
         }
-
         return try {
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
@@ -202,7 +217,11 @@ internal class UpstreamDnsResolver(
         val inFlight = mutableListOf<InFlightQuery>()
 
         batch.forEach { candidate ->
-            val task = CandidateQueryTask(candidate = candidate, rawQuery = rawQuery)
+            val task = CandidateQueryTask(
+                candidate = candidate,
+                rawQuery = rawQuery,
+                udpAttemptLimit = computeUdpAttemptLimit(candidate, batch.size)
+            )
             val future = completion.submit(task)
             inFlight += InFlightQuery(future = future, task = task)
         }
@@ -263,14 +282,10 @@ internal class UpstreamDnsResolver(
     private fun querySingleCandidate(
         candidate: UpstreamCandidate,
         rawQuery: ByteArray,
+        maxUdpAttempts: Int,
         onUdpSocketCreated: ((DatagramSocket) -> Unit)? = null,
         onTcpSocketCreated: ((Socket) -> Unit)? = null
     ): ByteArray {
-        val maxUdpAttempts = when {
-            hasCandidateSuccess(candidate) -> UDP_RETRY_ATTEMPTS_FOR_WARM_CANDIDATE
-            isWithinStartupWarmupWindow() -> UDP_RETRY_ATTEMPTS_DURING_STARTUP
-            else -> 1
-        }
         var udpError: Exception? = null
         repeat(maxUdpAttempts) { attempt ->
             try {
@@ -310,6 +325,17 @@ internal class UpstreamDnsResolver(
             }
             tcpError.addSuppressed(finalUdpError)
             throw tcpError
+        }
+    }
+
+    private fun computeUdpAttemptLimit(candidate: UpstreamCandidate, batchSize: Int): Int {
+        if (batchSize > 1) {
+            return 1
+        }
+        return when {
+            hasCandidateSuccess(candidate) -> UDP_RETRY_ATTEMPTS_FOR_WARM_CANDIDATE
+            isWithinStartupWarmupWindow() -> UDP_RETRY_ATTEMPTS_DURING_STARTUP
+            else -> 1
         }
     }
 
@@ -574,13 +600,7 @@ internal class UpstreamDnsResolver(
             }
         }
 
-        val extraResolvers = NETWORK_FALLBACK_DNS.mapNotNull { value ->
-            try {
-                InetAddress.getByName(value)
-            } catch (_: Exception) {
-                null
-            }
-        }
+        val extraResolvers = NETWORK_FALLBACK_DNS
 
         if (preferredNetwork != null) {
             extraResolvers.forEach { dns ->
@@ -642,11 +662,7 @@ internal class UpstreamDnsResolver(
                 },
                 { candidate ->
                     val host = candidateHost(candidate)
-                    val until = cooldownSnapshot[host] ?: 0L
-                    if (until <= now) 0L else max(1L, until - now)
-                },
-                { candidate ->
-                    candidate.priority
+                    -(successSnapshot[host] ?: 0)
                 },
                 { candidate ->
                     val host = candidateHost(candidate)
@@ -654,36 +670,14 @@ internal class UpstreamDnsResolver(
                 },
                 { candidate ->
                     val host = candidateHost(candidate)
-                    -(successSnapshot[host] ?: 0)
+                    val until = cooldownSnapshot[host] ?: 0L
+                    if (until <= now) 0L else max(1L, until - now)
+                },
+                { candidate ->
+                    candidate.priority
                 }
             )
         )
-
-        val successful = withCooldown.filter { candidate ->
-            (successSnapshot[candidateHost(candidate)] ?: 0) > 0
-        }
-        if (successful.isNotEmpty()) {
-            if (successful.size >= MIN_READY_CANDIDATES) {
-                return successful.take(MAX_PARALLEL_QUERIES)
-            }
-            val extras = withCooldown
-                .filterNot { candidate -> successful.contains(candidate) }
-                .take(MIN_READY_CANDIDATES - successful.size)
-            return (successful + extras).take(MAX_PARALLEL_QUERIES)
-        }
-
-        val ready = withCooldown.filter { candidate ->
-            val host = candidateHost(candidate)
-            (cooldownSnapshot[host] ?: 0L) <= now
-        }
-        if (ready.isNotEmpty()) {
-            if (ready.size >= MIN_READY_CANDIDATES) {
-                return ready
-            }
-            val extra = withCooldown.filterNot { candidate -> ready.contains(candidate) }
-                .take(MIN_READY_CANDIDATES - ready.size)
-            return ready + extra
-        }
 
         return withCooldown.take(MAX_PARALLEL_QUERIES)
     }
@@ -1047,9 +1041,11 @@ internal class UpstreamDnsResolver(
         private const val TCP_CONNECT_TIMEOUT_MS = 1200
         private const val TCP_QUERY_TIMEOUT_MS = 1500
         private const val MAX_PARALLEL_QUERIES = 4
-        // Keep one warm standby without forcing every cooled resolver on each query.
-        private const val MIN_READY_CANDIDATES = 2
-        private val NETWORK_FALLBACK_DNS = arrayOf("8.8.8.8", "1.1.1.1", "9.9.9.9")
+        private val NETWORK_FALLBACK_DNS = listOf(
+            InetAddress.getByAddress(byteArrayOf(8, 8, 8, 8)),
+            InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1)),
+            InetAddress.getByAddress(byteArrayOf(9, 9, 9, 9))
+        )
         private const val PRIORITY_CUSTOM = 0
         private const val PRIORITY_NETWORK_DISCOVERED = 10
         private const val PRIORITY_ACTIVE_NETWORK_FALLBACK = 20
