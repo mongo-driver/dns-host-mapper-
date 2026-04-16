@@ -183,9 +183,11 @@ internal class UpstreamDnsResolver(
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             future.cancel(true)
+            Log.w(LOG_TAG, "System DNS fallback timed out after ${timeoutMs}ms")
             null
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             future.cancel(true)
+            Log.w(LOG_TAG, "System DNS fallback failed: ${e.message}")
             null
         }
     }
@@ -329,11 +331,9 @@ internal class UpstreamDnsResolver(
     }
 
     private fun computeUdpAttemptLimit(candidate: UpstreamCandidate, batchSize: Int): Int {
-        if (batchSize > 1) {
-            return 1
-        }
         return when {
             hasCandidateSuccess(candidate) -> UDP_RETRY_ATTEMPTS_FOR_WARM_CANDIDATE
+            batchSize > 1 -> 1
             isWithinStartupWarmupWindow() -> UDP_RETRY_ATTEMPTS_DURING_STARTUP
             else -> 1
         }
@@ -679,7 +679,31 @@ internal class UpstreamDnsResolver(
             )
         )
 
-        return withCooldown.take(MAX_PARALLEL_QUERIES)
+        val ready = withCooldown.filter { candidate ->
+            val host = candidateHost(candidate)
+            (cooldownSnapshot[host] ?: 0L) <= now
+        }
+
+        if (ready.isNotEmpty()) {
+            val warmReady = ready.filter { candidate ->
+                (successSnapshot[candidateHost(candidate)] ?: 0) > 0
+            }
+            if (warmReady.isNotEmpty()) {
+                val selected = LinkedHashSet<UpstreamCandidate>()
+                selected.addAll(warmReady.take(WARM_READY_CANDIDATE_COUNT))
+                ready.forEach { candidate ->
+                    if (selected.size >= WARM_READY_CANDIDATE_COUNT) {
+                        return@forEach
+                    }
+                    selected.add(candidate)
+                }
+                return selected.toList()
+            }
+
+            return ready.take(BOOTSTRAP_CANDIDATE_COUNT)
+        }
+
+        return withCooldown.take(COOLDOWN_PROBE_CANDIDATE_COUNT)
     }
 
     private fun resolveUsingSystemDns(rawQuery: ByteArray): ByteArray? {
@@ -1041,6 +1065,9 @@ internal class UpstreamDnsResolver(
         private const val TCP_CONNECT_TIMEOUT_MS = 1200
         private const val TCP_QUERY_TIMEOUT_MS = 1500
         private const val MAX_PARALLEL_QUERIES = 4
+        private const val BOOTSTRAP_CANDIDATE_COUNT = 2
+        private const val WARM_READY_CANDIDATE_COUNT = 2
+        private const val COOLDOWN_PROBE_CANDIDATE_COUNT = 1
         private val NETWORK_FALLBACK_DNS = listOf(
             InetAddress.getByAddress(byteArrayOf(8, 8, 8, 8)),
             InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1)),
