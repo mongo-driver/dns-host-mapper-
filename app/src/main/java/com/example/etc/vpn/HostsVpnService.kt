@@ -8,6 +8,10 @@ import com.example.etc.data.HostRuleStore
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 class HostsVpnService : VpnService() {
@@ -119,25 +123,52 @@ class HostsVpnService : VpnService() {
             FileInputStream(iface.fileDescriptor).use { input ->
                 FileOutputStream(iface.fileDescriptor).use { output ->
                     val packetBuffer = ByteArray(VPN_MTU * 2)
-                    while (active && activeSessionId == sessionId) {
-                        val readBytes = try {
-                            input.read(packetBuffer)
-                        } catch (e: Exception) {
-                            Log.w(LOG_TAG, "Tunnel read failed/closed", e)
-                            break
-                        }
+                    val packetWorkers = newPacketWorkerPool()
+                    val outputWriteLock = Any()
+                    try {
+                        while (active && activeSessionId == sessionId) {
+                            val readBytes = try {
+                                input.read(packetBuffer)
+                            } catch (e: Exception) {
+                                Log.w(LOG_TAG, "Tunnel read failed/closed", e)
+                                break
+                            }
 
-                        if (readBytes <= 0) {
-                            continue
-                        }
+                            if (readBytes <= 0) {
+                                continue
+                            }
 
-                        val response = handleDnsPacket(packetBuffer, readBytes) ?: continue
+                            val packetCopy = packetBuffer.copyOf(readBytes)
+                            try {
+                                packetWorkers.execute {
+                                    val response = handleDnsPacket(packetCopy, packetCopy.size) ?: return@execute
+                                    if (!active || activeSessionId != sessionId) {
+                                        return@execute
+                                    }
+                                    try {
+                                        synchronized(outputWriteLock) {
+                                            if (active && activeSessionId == sessionId) {
+                                                output.write(response)
+                                            }
+                                        }
+                                    } catch (e: IOException) {
+                                        // Interface can be closed while stopping VPN.
+                                        Log.w(LOG_TAG, "Tunnel worker write failed/closed", e)
+                                    }
+                                }
+                            } catch (_: RejectedExecutionException) {
+                                // Worker pool is shutting down while VPN is stopping.
+                                break
+                            }
+                        }
+                    } finally {
+                        packetWorkers.shutdownNow()
                         try {
-                            output.write(response)
-                        } catch (e: IOException) {
-                            // Interface can be closed while stopping VPN.
-                            Log.w(LOG_TAG, "Tunnel write failed/closed", e)
-                            break
+                            if (!packetWorkers.awaitTermination(PACKET_WORKER_AWAIT_MS, TimeUnit.MILLISECONDS)) {
+                                Log.w(LOG_TAG, "Packet worker pool did not terminate cleanly")
+                            }
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
                         }
                     }
                 }
@@ -151,6 +182,10 @@ class HostsVpnService : VpnService() {
             closeTunnelInterface(iface)
             Log.i(LOG_TAG, "runTunnelLoop finished session=$sessionId")
         }
+    }
+
+    private fun newPacketWorkerPool(): ExecutorService {
+        return Executors.newFixedThreadPool(PACKET_WORKER_THREADS)
     }
 
     private fun handleDnsPacket(packet: ByteArray, packetLength: Int): ByteArray? {
@@ -428,6 +463,8 @@ class HostsVpnService : VpnService() {
         private const val DNS_PORT = 53
         private const val MDNS_PORT = 5353
         private const val VPN_MTU = 1500
+        private const val PACKET_WORKER_THREADS = 8
+        private const val PACKET_WORKER_AWAIT_MS = 1200L
         private const val VPN_CLIENT_ADDRESS = "10.9.0.2"
         private const val VPN_CLIENT_ADDRESS_V6 = "fd00:10:9::2"
         private const val VPN_DNS_ADDRESS = "10.9.0.1"

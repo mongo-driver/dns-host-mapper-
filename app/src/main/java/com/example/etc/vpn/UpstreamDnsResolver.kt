@@ -683,14 +683,22 @@ internal class UpstreamDnsResolver(
             val host = candidateHost(candidate)
             (cooldownSnapshot[host] ?: 0L) <= now
         }
+        val customCandidates = withCooldown.filter { candidate ->
+            candidate.priority == PRIORITY_CUSTOM
+        }
+        val nearestCustomCandidate = customCandidates.minByOrNull { candidate ->
+            val host = candidateHost(candidate)
+            val until = cooldownSnapshot[host] ?: 0L
+            if (until <= now) 0L else until - now
+        }
 
         if (ready.isNotEmpty()) {
-            val warmReady = ready.filter { candidate ->
-                (successSnapshot[candidateHost(candidate)] ?: 0) > 0
+            val readyCustom = ready.filter { candidate ->
+                candidate.priority == PRIORITY_CUSTOM
             }
-            if (warmReady.isNotEmpty()) {
+            if (readyCustom.isNotEmpty()) {
                 val selected = LinkedHashSet<UpstreamCandidate>()
-                selected.addAll(warmReady.take(WARM_READY_CANDIDATE_COUNT))
+                selected.add(readyCustom.first())
                 ready.forEach { candidate ->
                     if (selected.size >= WARM_READY_CANDIDATE_COUNT) {
                         return@forEach
@@ -700,11 +708,24 @@ internal class UpstreamDnsResolver(
                 return selected.toList()
             }
 
+            if (nearestCustomCandidate != null) {
+                val selected = LinkedHashSet<UpstreamCandidate>()
+                selected.add(ready.first())
+                selected.add(nearestCustomCandidate)
+                return selected.toList()
+            }
+
             return ready.take(BOOTSTRAP_CANDIDATE_COUNT)
         }
 
-        // Everyone is cooling down. Do not probe aggressively on every query;
-        // rely on system DNS fallback and cache until a resolver becomes ready.
+        // No resolver is currently ready.
+        // If a custom DNS server is configured, keep probing it so mapped/custom behavior
+        // recovers quickly instead of returning an empty candidate set.
+        if (nearestCustomCandidate != null) {
+            return listOf(nearestCustomCandidate)
+        }
+
+        // No custom resolver exists; only probe cooled resolvers near expiry.
         val coolingWithSuccess = withCooldown.filter { candidate ->
             val host = candidateHost(candidate)
             val hasSuccess = (successSnapshot[host] ?: 0) > 0
