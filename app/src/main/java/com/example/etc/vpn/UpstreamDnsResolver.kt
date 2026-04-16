@@ -703,7 +703,9 @@ internal class UpstreamDnsResolver(
             return ready.take(BOOTSTRAP_CANDIDATE_COUNT)
         }
 
-        return withCooldown.take(COOLDOWN_PROBE_CANDIDATE_COUNT)
+        // Everyone is cooling down. Do not probe aggressively on every query;
+        // rely on system DNS fallback and cache until a resolver becomes ready.
+        return emptyList()
     }
 
     private fun resolveUsingSystemDns(rawQuery: ByteArray): ByteArray? {
@@ -1067,7 +1069,6 @@ internal class UpstreamDnsResolver(
         private const val MAX_PARALLEL_QUERIES = 4
         private const val BOOTSTRAP_CANDIDATE_COUNT = 2
         private const val WARM_READY_CANDIDATE_COUNT = 2
-        private const val COOLDOWN_PROBE_CANDIDATE_COUNT = 1
         private val NETWORK_FALLBACK_DNS = listOf(
             InetAddress.getByAddress(byteArrayOf(8, 8, 8, 8)),
             InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1)),
