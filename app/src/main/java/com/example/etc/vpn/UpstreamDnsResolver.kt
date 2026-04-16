@@ -108,7 +108,8 @@ internal class UpstreamDnsResolver(
     private val connectivityManager =
         vpnService.getSystemService(ConnectivityManager::class.java)
     private val queryExecutor: ExecutorService = Executors.newFixedThreadPool(MAX_PARALLEL_QUERIES)
-    private val systemFallbackExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val systemFallbackExecutor: ExecutorService =
+        Executors.newFixedThreadPool(SYSTEM_FALLBACK_PARALLELISM)
     private val responseCache = object : LinkedHashMap<String, CachedResponse>(MAX_CACHE_ENTRIES, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedResponse>?): Boolean {
             return size > MAX_CACHE_ENTRIES
@@ -128,38 +129,33 @@ internal class UpstreamDnsResolver(
         val candidates = findDnsCandidates()
         Log.i(LOG_TAG, "Upstream resolver candidates=${candidates.joinToString(",") { candidateLabel(it) }}")
 
+        val liveResponse = queryCandidatesParallel(rawQuery, candidates)
+        if (liveResponse != null) {
+            cacheResponseIfEligible(queryKey, liveResponse)
+            return liveResponse
+        }
+
         val systemFallbackTimeoutMs = if (candidates.isEmpty()) {
             SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS
         } else {
             SYSTEM_FALLBACK_TIMEOUT_MS
         }
-        val systemFallbackFuture = submitSystemFallback(rawQuery)
-
-        try {
-            val liveResponse = queryCandidatesParallel(rawQuery, candidates)
-            if (liveResponse != null) {
-                cacheResponseIfEligible(queryKey, liveResponse)
-                return liveResponse
-            }
-
-            val systemFallback = awaitSystemFallback(systemFallbackFuture, systemFallbackTimeoutMs)
-            if (systemFallback != null) {
-                cacheResponseIfEligible(queryKey, systemFallback)
-                return systemFallback
-            }
-
-            val cachedResponse = readCachedResponse(queryKey, rawQuery)
-            if (cachedResponse != null) {
-                return cachedResponse
-            }
-
-            Log.w(LOG_TAG, "Upstream resolver returned null response")
-            return null
-        } finally {
-            if (systemFallbackFuture != null && !systemFallbackFuture.isDone) {
-                systemFallbackFuture.cancel(true)
-            }
+        val systemFallback = awaitSystemFallback(
+            future = submitSystemFallback(rawQuery),
+            timeoutMs = systemFallbackTimeoutMs
+        )
+        if (systemFallback != null) {
+            cacheResponseIfEligible(queryKey, systemFallback)
+            return systemFallback
         }
+
+        val cachedResponse = readCachedResponse(queryKey, rawQuery)
+        if (cachedResponse != null) {
+            return cachedResponse
+        }
+
+        Log.w(LOG_TAG, "Upstream resolver returned null response")
+        return null
     }
 
     fun close() {
@@ -451,7 +447,11 @@ internal class UpstreamDnsResolver(
             isTimeoutLike || isBindLike -> {
                 if (hasSuccess) {
                     if (failureCount >= WARM_PATH_FAILURE_THRESHOLD) {
-                        WARM_PATH_COOLDOWN_MS
+                        if (candidate.priority == PRIORITY_CUSTOM) {
+                            CUSTOM_WARM_PATH_COOLDOWN_MS
+                        } else {
+                            WARM_PATH_COOLDOWN_MS
+                        }
                     } else {
                         0L
                     }
@@ -705,6 +705,20 @@ internal class UpstreamDnsResolver(
 
         // Everyone is cooling down. Do not probe aggressively on every query;
         // rely on system DNS fallback and cache until a resolver becomes ready.
+        val coolingWithSuccess = withCooldown.filter { candidate ->
+            val host = candidateHost(candidate)
+            val hasSuccess = (successSnapshot[host] ?: 0) > 0
+            val cooldownUntil = cooldownSnapshot[host] ?: 0L
+            hasSuccess && cooldownUntil > now
+        }
+        val nextProbe = coolingWithSuccess.firstOrNull()
+        if (nextProbe != null) {
+            val remainingMs = (cooldownSnapshot[candidateHost(nextProbe)] ?: 0L) - now
+            if (remainingMs <= NEAR_COOLDOWN_PROBE_MS) {
+                return listOf(nextProbe)
+            }
+        }
+
         return emptyList()
     }
 
@@ -1090,11 +1104,14 @@ internal class UpstreamDnsResolver(
         private const val COLD_START_FAILURE_THRESHOLD = 3
         private const val WARM_PATH_FAILURE_THRESHOLD = 3
         private const val WARM_PATH_COOLDOWN_MS = 5_000L
+        private const val CUSTOM_WARM_PATH_COOLDOWN_MS = 2_000L
+        private const val NEAR_COOLDOWN_PROBE_MS = 1_500L
         private const val TCP_FALLBACK_DISABLE_MS = 600_000L
         private const val STARTUP_WARMUP_WINDOW_MS = 20_000L
         private const val STARTUP_WARMUP_FAILURE_THRESHOLD = 2
         private const val UDP_RETRY_ATTEMPTS_DURING_STARTUP = 2
         private const val UDP_RETRY_ATTEMPTS_FOR_WARM_CANDIDATE = 2
+        private const val SYSTEM_FALLBACK_PARALLELISM = 2
         private const val SYSTEM_FALLBACK_TIMEOUT_MS = 4000L
         private const val SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS = 6000L
     }
