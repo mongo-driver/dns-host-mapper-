@@ -265,22 +265,32 @@ internal class UpstreamDnsResolver(
         onUdpSocketCreated: ((DatagramSocket) -> Unit)? = null,
         onTcpSocketCreated: ((Socket) -> Unit)? = null
     ): ByteArray {
-        val udpError = try {
-            return querySingleCandidateUdp(candidate, rawQuery, onUdpSocketCreated)
-        } catch (e: Exception) {
-            if (isCancellationLike(e)) {
-                throw CancellationException("UDP query canceled")
+        val maxUdpAttempts = if (hasCandidateSuccess(candidate)) UDP_RETRY_ATTEMPTS_FOR_WARM_CANDIDATE else 1
+        var udpError: Exception? = null
+        repeat(maxUdpAttempts) { attempt ->
+            try {
+                return querySingleCandidateUdp(candidate, rawQuery, onUdpSocketCreated)
+            } catch (e: Exception) {
+                if (isCancellationLike(e)) {
+                    throw CancellationException("UDP query canceled")
+                }
+                udpError = e
+                val isLastAttempt = attempt == maxUdpAttempts - 1
+                if (!isTimeoutLike(e) || isLastAttempt) {
+                    return@repeat
+                }
             }
-            e
         }
 
-        if (!shouldTryTcpFallback(candidate, udpError)) {
-            throw udpError
+        val finalUdpError = udpError ?: IOException("UDP query failed")
+
+        if (!shouldTryTcpFallback(candidate, finalUdpError)) {
+            throw finalUdpError
         }
 
         Log.w(
             LOG_TAG,
-            "UDP upstream failed for ${candidateHost(candidate)} (${udpError.message}), trying TCP fallback"
+            "UDP upstream failed for ${candidateHost(candidate)} (${finalUdpError.message}), trying TCP fallback"
         )
 
         try {
@@ -293,7 +303,7 @@ internal class UpstreamDnsResolver(
             if (isTcpRefusedLike(tcpError)) {
                 temporarilyDisableTcpFallback(candidate)
             }
-            tcpError.addSuppressed(udpError)
+            tcpError.addSuppressed(finalUdpError)
             throw tcpError
         }
     }
@@ -641,17 +651,24 @@ internal class UpstreamDnsResolver(
             )
         )
 
+        val successful = withCooldown.filter { candidate ->
+            (successSnapshot[candidateHost(candidate)] ?: 0) > 0
+        }
+        if (successful.isNotEmpty()) {
+            if (successful.size >= MIN_READY_CANDIDATES) {
+                return successful.take(MAX_PARALLEL_QUERIES)
+            }
+            val extras = withCooldown
+                .filterNot { candidate -> successful.contains(candidate) }
+                .take(MIN_READY_CANDIDATES - successful.size)
+            return (successful + extras).take(MAX_PARALLEL_QUERIES)
+        }
+
         val ready = withCooldown.filter { candidate ->
             val host = candidateHost(candidate)
             (cooldownSnapshot[host] ?: 0L) <= now
         }
         if (ready.isNotEmpty()) {
-            val readyWithSuccess = ready.filter { candidate ->
-                (successSnapshot[candidateHost(candidate)] ?: 0) > 0
-            }
-            if (readyWithSuccess.isNotEmpty()) {
-                return readyWithSuccess
-            }
             if (ready.size >= MIN_READY_CANDIDATES) {
                 return ready
             }
@@ -942,6 +959,13 @@ internal class UpstreamDnsResolver(
         }
     }
 
+    private fun hasCandidateSuccess(candidate: UpstreamCandidate): Boolean {
+        val host = candidateHost(candidate)
+        synchronized(candidateCooldownUntilMs) {
+            return (candidateSuccessCount[host] ?: 0) > 0
+        }
+    }
+
     private fun isTruncatedDnsResponse(packet: ByteArray): Boolean {
         if (packet.size < DNS_HEADER_SIZE) {
             return false
@@ -1031,7 +1055,8 @@ internal class UpstreamDnsResolver(
         private const val WARM_PATH_FAILURE_THRESHOLD = 3
         private const val WARM_PATH_COOLDOWN_MS = 5_000L
         private const val TCP_FALLBACK_DISABLE_MS = 600_000L
-        private const val SYSTEM_FALLBACK_TIMEOUT_MS = 1200L
-        private const val SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS = 2500L
+        private const val UDP_RETRY_ATTEMPTS_FOR_WARM_CANDIDATE = 2
+        private const val SYSTEM_FALLBACK_TIMEOUT_MS = 4000L
+        private const val SYSTEM_FALLBACK_TIMEOUT_EMPTY_MS = 6000L
     }
 }
