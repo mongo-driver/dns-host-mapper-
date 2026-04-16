@@ -65,11 +65,16 @@ This project provides a user-space alternative by:
 
 ## Screenshots
 
-![Main Screen](docs/images/main-screen.png)
-![Manage DNS Servers](docs/images/manage-dns-servers.png)
-![Ping git.ir](docs/images/ping-git-ir.png)
-![Ping hasan.local](docs/images/ping-hasan-local.png)
-![Ping soft98.ir](docs/images/ping-soft98-ir.png)
+<p align="center">
+  <img src="docs/images/main-screen.png" alt="Main Screen" width="280" />
+  <img src="docs/images/manage-dns-servers.png" alt="Manage DNS Servers" width="280" />
+</p>
+
+<p align="center">
+  <img src="docs/images/ping-git-ir.png" alt="Ping git.ir" width="280" />
+  <img src="docs/images/ping-hasan-local.png" alt="Ping hasan.local" width="280" />
+  <img src="docs/images/ping-soft98-ir.png" alt="Ping soft98.ir" width="280" />
+</p>
 
 ## Troubleshooting
 
